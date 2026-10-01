@@ -328,7 +328,7 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", d
     total_size = data_size
     test_data = b"T" * data_size
 
-    MAX_SEGMENT_SIZE = 1024
+    MAX_SEGMENT_SIZE = 900
     num_segments = (total_size + MAX_SEGMENT_SIZE - 1) // MAX_SEGMENT_SIZE
 
     print(f"Test params: data_size={data_size}, segments={num_segments}, device_id={device_id}")
