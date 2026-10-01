@@ -103,7 +103,9 @@ class DeviceManager:
         return num
 
     def get_device_id(self, device_num):
-        return self.devices.get(device_num)
+        if isinstance(device_num, int):
+            return self.devices.get(device_num)
+        return device_num
 
     def list_devices(self):
         return list(self.devices.items())
@@ -317,21 +319,12 @@ def check_and_load_channel(gateway, target_channel, target_name):
         return False, "Failed to load channel"
 
 
-def send_test(gateway, channel, use_wifi, peer_index=0, data_size=5000, device_num=0, device_mgr=None):
+def send_test(gateway, channel, use_wifi, peer_index=0, data_size=5000, device_id="sensor1", device_mgr=None):
     packet_id = 1
     total_size = data_size
     test_data = b"T" * data_size
 
-    if device_mgr is None:
-        device_mgr = DeviceManager()
-
-    device_id = device_mgr.get_device_id(device_num)
-    if device_id is None:
-        print(f"Error: No device registered at number {device_num}")
-        print(f"Known devices: {device_mgr.list_devices()}")
-        return False
-
-    print(f"Test params: data_size={data_size}, device_num={device_num}, device_id={device_id}, peer={peer_index}")
+    print(f"Test params: data_size={data_size}, device_id={device_id}, peer={peer_index}")
 
     if use_wifi:
         device_bytes = device_id.encode("utf-8")
@@ -532,9 +525,9 @@ def main():
     )
     parser.add_argument(
         "-d", "--device",
-        type=int,
-        default=0,
-        help="Device number for WiFi (default: 0)"
+        type=str,
+        default="sensor1",
+        help="Device ID for WiFi (default: sensor1)"
     )
     args = parser.parse_args()
 

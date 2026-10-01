@@ -612,10 +612,10 @@ def main():
         help="Device ID for WiFi (default: sensor1)"
     )
     parser.add_argument(
-        "-n", "--peer",
-        type=int,
-        default=0,
-        help="Peer index for ESP-NOW (default: 0)"
+        "-d", "--device",
+        type=str,
+        default="sensor1",
+        help="Device ID for WiFi (default: sensor1)"
     )
     args = parser.parse_args()
 
