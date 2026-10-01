@@ -707,6 +707,7 @@ def main():
 
     gateway = USBGateway(serial=args.serial)
     device_mgr = DeviceManager()
+    peer_mgr = None
 
     try:
         gateway.open()
@@ -720,6 +721,12 @@ def main():
             print(f"Failed: {msg}")
             return 1
 
+        if not args.wifi:
+            peer_mgr = PeerManager()
+            peer_mgr.load()
+            peer_mgr.register_with_device(gateway)
+            time.sleep(0.5)
+
         if args.list:
             print(f"Using channel {target_channel} ({target_name})")
             list_clients(gateway, args.wifi, device_mgr)
@@ -728,7 +735,7 @@ def main():
             receive_loop(gateway, target_channel, args.wifi, args.timeout, device_mgr)
         elif args.send is not None:
             print(f"Using channel {target_channel} ({target_name})")
-            ok = send_test(gateway, target_channel, args.wifi, args.send, args.device, args.peer, device_mgr)
+            ok = send_test(gateway, target_channel, args.wifi, args.send, args.device, device_mgr, peer_mgr)
             if not ok:
                 return 1
         else:
