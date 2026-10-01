@@ -328,7 +328,10 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", d
     total_size = data_size
     test_data = b"T" * data_size
 
-    print(f"Test params: data_size={data_size}, device_id={device_id}")
+    MAX_SEGMENT_SIZE = 1024
+    num_segments = (total_size + MAX_SEGMENT_SIZE - 1) // MAX_SEGMENT_SIZE
+
+    print(f"Test params: data_size={data_size}, segments={num_segments}, device_id={device_id}")
 
     if use_wifi:
         device_bytes = device_id.encode("utf-8")
@@ -340,92 +343,112 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", d
 
     handshake_payload = encode_handshake(packet_id, total_size)
     full_payload = wrapper + bytes([MSG_FILE_HANDSHAKE]) + handshake_payload
-    print(f"Sending handshake: packet_id={packet_id}, total_size={total_size}, payload_len={len(full_payload)}")
+    print(f"Sending handshake: packet_id={packet_id}, total_size={total_size}, segments={num_segments}")
     gateway.send(channel, MSG_COMMAND, full_payload)
 
-    start = time.time()
-    ack_received = False
-    while (time.time() - start) < 5:
-        frames = gateway.read(timeout_ms=200)
-        for ch, msg_type, payload in frames:
-            if ch == channel and msg_type == MSG_EVENT:
-                if use_wifi:
-                    if len(payload) > 1:
-                        device_len = payload[0]
-                        if len(payload) > 1 + device_len:
-                            src_device = payload[1:1 + device_len].decode("utf-8", "replace")
-                            resp_payload = payload[1 + device_len:]
+    def wait_for_ack(expected_seg, timeout=3):
+        start = time.time()
+        while (time.time() - start) < timeout:
+            frames = gateway.read(timeout_ms=200)
+            for ch, msg_type, payload in frames:
+                if ch == channel and msg_type == MSG_EVENT:
+                    if use_wifi:
+                        if len(payload) > 1:
+                            device_len = payload[0]
+                            if len(payload) > 1 + device_len:
+                                src_device = payload[1:1 + device_len].decode("utf-8", "replace")
+                                resp_payload = payload[1 + device_len:]
+                            else:
+                                continue
                         else:
                             continue
                     else:
+                        src_device = None
+                        resp_payload = payload[1:] if len(payload) > 1 else b""
+
+                    if use_wifi and src_device != device_id:
                         continue
-                else:
-                    src_device = None
-                    resp_payload = payload[1:] if len(payload) > 1 else b""
 
-                if use_wifi and src_device != device_id:
-                    print(f"  Ignoring ACK from device '{src_device}' (waiting for '{device_id}')")
-                    continue
+                    if len(resp_payload) >= 5 and resp_payload[0] == MSG_FILE_ACK:
+                        ack_pid = resp_payload[1]
+                        ack_seg = int.from_bytes(resp_payload[2:4], "little")
+                        ack_res = resp_payload[4] if len(resp_payload) > 4 else 0
+                        return ack_pid, ack_seg, ack_res
+            time.sleep(0.05)
+        return None
 
-                if len(resp_payload) >= 5 and resp_payload[0] == MSG_FILE_ACK:
-                    ack_pid = resp_payload[1]
-                    ack_seg = int.from_bytes(resp_payload[2:4], "little")
-                    ack_res = resp_payload[4] if len(resp_payload) > 4 else 0
-                    print(f"Received ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
-                    ack_received = True
-                    break
-        if ack_received:
-            break
-        time.sleep(0.05)
+    def wait_for_echo(expected_seg, timeout=3):
+        start = time.time()
+        while (time.time() - start) < timeout:
+            frames = gateway.read(timeout_ms=200)
+            for ch, msg_type, payload in frames:
+                if ch == channel and msg_type == MSG_EVENT:
+                    if use_wifi:
+                        if len(payload) > 1:
+                            device_len = payload[0]
+                            if len(payload) > 1 + device_len:
+                                src_device = payload[1:1 + device_len].decode("utf-8", "replace")
+                                resp_payload = payload[1 + device_len:]
+                            else:
+                                continue
+                        else:
+                            continue
+                    else:
+                        src_device = None
+                        resp_payload = payload[1:] if len(payload) > 1 else b""
 
-    if not ack_received:
-        print("No ACK received")
+                    if use_wifi and src_device != device_id:
+                        continue
+
+                    if len(resp_payload) >= 3 and resp_payload[0] == MSG_FILE_DATA:
+                        if len(resp_payload) >= HEADER_SIZE + 1:
+                            recv_pid, recv_seg = parse_header(resp_payload[1:HEADER_SIZE+1])
+                            recv_data = resp_payload[HEADER_SIZE+1:]
+                            return recv_pid, recv_seg, recv_data
+            time.sleep(0.05)
+        return None
+
+    ack = wait_for_ack(0, timeout=3)
+    if ack is None:
+        print(f"Error: No ACK from device '{device_id}' (invalid or not connected)")
         return False
+    ack_pid, ack_seg, ack_res = ack
+    print(f"Received ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
 
-    data_payload = get_header(packet_id, 0) + test_data
-    full_payload = wrapper + bytes([MSG_FILE_DATA]) + data_payload
-    print(f"Sending data packet: packet_id={packet_id}, segment=0, size={len(test_data)}")
-    gateway.send(channel, MSG_COMMAND, full_payload)
+    echoed_data = bytearray()
+    for seg in range(num_segments):
+        start_byte = seg * MAX_SEGMENT_SIZE
+        end_byte = min(start_byte + MAX_SEGMENT_SIZE, total_size)
+        segment_data = test_data[start_byte:end_byte]
 
-    start = time.time()
-    echo_received = False
-    while (time.time() - start) < 5:
-        frames = gateway.read(timeout_ms=200)
-        for ch, msg_type, payload in frames:
-            if ch == channel and msg_type == MSG_EVENT:
-                if use_wifi:
-                    if len(payload) > 1:
-                        device_len = payload[0]
-                        if len(payload) > 1 + device_len:
-                            src_device = payload[1:1 + device_len].decode("utf-8", "replace")
-                            resp_payload = payload[1 + device_len:]
-                        else:
-                            continue
-                    else:
-                        continue
-                else:
-                    src_device = None
-                    resp_payload = payload[1:] if len(payload) > 1 else b""
+        data_payload = get_header(packet_id, seg) + segment_data
+        full_payload = wrapper + bytes([MSG_FILE_DATA]) + data_payload
+        print(f"Sending segment {seg}/{num_segments - 1}: size={len(segment_data)}")
+        gateway.send(channel, MSG_COMMAND, full_payload)
 
-                if use_wifi and src_device != device_id:
-                    print(f"  Ignoring echo from device '{src_device}' (waiting for '{device_id}')")
-                    continue
+        ack = wait_for_ack(seg, timeout=3)
+        if ack is None:
+            print(f"  No ACK for segment {seg}")
+            return False
+        ack_pid, ack_seg, ack_res = ack
 
-                if len(resp_payload) >= 3 and resp_payload[0] == MSG_FILE_DATA:
-                    if len(resp_payload) >= HEADER_SIZE + 1:
-                        recv_pid, recv_seg = parse_header(resp_payload[1:HEADER_SIZE+1])
-                        recv_data = resp_payload[HEADER_SIZE+1:]
-                        print(f"Received echo: pid={recv_pid}, seg={recv_seg}, size={len(recv_data)}")
-                        if recv_data == test_data:
-                            print("Data integrity verified!")
-                            return True
-                        else:
-                            print("Data mismatch!")
-                            return False
-        time.sleep(0.05)
+        echo = wait_for_echo(seg, timeout=3)
+        if echo is None:
+            print(f"  No echo for segment {seg}")
+            return False
+        recv_pid, recv_seg, recv_data = echo
+        if recv_data != segment_data:
+            print(f"  Segment {seg} mismatch: expected {len(segment_data)}, got {len(recv_data)}")
+            return False
+        echoed_data.extend(recv_data)
+        print(f"  Echo seg={recv_seg}, size={len(recv_data)} OK")
 
-    print("No echo received")
-    return False
+    if echoed_data == test_data:
+        print("Data integrity verified!")
+        return True
+    else:
+        print(f"Data mismatch: expected {len(test_data)}, got {len(echoed_data)}")
+        return False
 
 
 def list_clients(gateway, use_wifi, device_mgr=None):
