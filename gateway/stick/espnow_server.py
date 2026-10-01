@@ -294,7 +294,7 @@ class ESPNowRadio:
     def _handle_outbound(self, msg_type, payload):
         """Handle outbound messages from the host.
 
-        MSG_COMMAND payload: peer_index:u8 + message:string
+        MSG_COMMAND payload: peer_index:u8 + binary_data
         MSG_PEER_ADD payload: mac:6-bytes + lmk:16-bytes (optional)
         MSG_PEER_DEL payload: mac:6-bytes
         
@@ -310,24 +310,24 @@ class ESPNowRadio:
                 return -1  # No peer index
 
             peer_index = payload[0]
-            message = payload[1:].decode("utf-8", "replace")
+            data = payload[1:]
 
             peer_macs = self.get_peer_macs()
             if not peer_macs:
                 if self.debug:
                     print("Outbound: no peers registered")
                 return -2  # No peers
-            
+
             if peer_index >= len(peer_macs):
                 if self.debug:
                     print(f"Outbound: invalid peer index {peer_index} (max {len(peer_macs)-1})")
                 return -3  # Invalid peer index
 
             mac = peer_macs[peer_index]
-            full_payload = self.shared_key[:16] + message.encode()
+            full_payload = self.shared_key[:16] + data
 
             if self.debug:
-                print(f"Outbound to peer {peer_index} ({mac.hex()}): {message}")
+                print(f"Outbound to peer {peer_index} ({mac.hex()}): {len(data)} bytes")
 
             result = self.send_to_peer(mac, full_payload)
             return result  # 1 for success, 0 for failure
