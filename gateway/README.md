@@ -550,6 +550,99 @@ The filesystem handlers are implemented in `stick/usb_channel_server.py` in the 
 
 ---
 
+## Radio File Transfer Utility
+
+The `radio_util.py` tool provides file transfer capabilities over ESP-NOW or WiFi radio links.
+
+### Overview
+
+- Supports both ESP-NOW (`-e`) and WiFi (`-w`) modes
+- Checks if required radio channel is loaded, loads it if not
+- Prompts for confirmation when switching between WiFi and ESP-NOW (they are mutually exclusive)
+- Implements a robust transfer protocol with handshake and acknowledgment
+
+### Transfer Protocol
+
+The protocol uses a 16-bit header per packet:
+- Upper 4 bits: packet ID (0-15)
+- Lower 12 bits: segment number (0-4095)
+
+**Handshake Phase:**
+1. Source sends `MSG_FILE_HANDSHAKE` with: `packet_id(1) + total_size(4)`
+2. Target responds with `MSG_FILE_ACK` to confirm buffer allocation
+
+**Data Transfer Phase:**
+1. Source sends `MSG_FILE_DATA` with: `header(2) + data(~4KB)`
+2. Target echoes back the data packet
+3. Source verifies integrity
+
+### Host Tool: radio_util.py
+
+```bash
+# Load WiFi channel and poll for incoming data
+python3 host/radio_util.py -w -p
+
+# Load ESP-NOW channel and run test (sends test packet)
+python3 host/radio_util.py -e -t
+```
+
+Options:
+- `-e, --espnow` - Use ESP-NOW radio (USB channel 3)
+- `-w, --wifi` - Use WiFi server (USB channel 4)
+- `-t, --test` - Run host test mode (send test packet)
+- `-p, --poll` - Poll for incoming client data
+
+### Host Tool: radio_util_test.py
+
+A simpler test utility for the radio transfer protocol.
+
+```bash
+# Send test data (1KB) over WiFi
+python3 host/radio_util_test.py -w -s 1024
+
+# Receive mode (wait for incoming data)
+python3 host/radio_util_test.py -e -r
+
+# Send test data over ESP-NOW
+python3 host/radio_util_test.py -e -s 512
+```
+
+Options:
+- `-e, --espnow` - Use ESP-NOW radio
+- `-w, --wifi` - Use WiFi server
+- `-s, --send SIZE` - Send test data of specified size
+- `-r, --receive` - Receive mode (wait for incoming data)
+- `-t, --timeout` - Receive timeout in seconds (default: 30)
+
+### MicroPython Clients
+
+**client/radio_util_espnow.py** - ESP-NOW client for testing file transfer:
+```python
+import radio_util_espnow
+radio_util_espnow.run_test()      # Run test sequence
+radio_util_espnow.run_echo_mode() # Echo server mode
+```
+
+**client/radio_util_wifi.py** - WiFi client for testing file transfer:
+```python
+import radio_util_wifi
+radio_util_wifi.run_test()        # Run test sequence
+radio_util_wifi.run_echo_server() # Echo server mode (use "echo" argument)
+```
+
+Both clients require:
+- `private.py` - WiFi credentials and keys
+- `config.json` - Device configuration
+
+### Protocol Constants
+
+The following message types are defined in `common/channel_defs.py`:
+- `MSG_FILE_HANDSHAKE = 0x30` - Transfer initialization
+- `MSG_FILE_DATA = 0x31` - Data packet transfer
+- `MSG_FILE_ACK = 0x32` - Acknowledgment
+
+---
+
 ## Next Steps
 
 - Add sensor base class
