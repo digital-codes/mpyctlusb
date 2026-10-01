@@ -654,8 +654,8 @@ def poll_for_clients(gateway, use_wifi=False, use_espnow=False, device_mgr=None)
                                 device_id = payload[1:1+device_len].decode("utf-8", "replace")
 
                         if device_id:
-                            dev_num = device_mgr.add_device(device_id)
-                            print(f"Device {dev_num}: {device_id}")
+                            device_mgr.add_device(device_id)
+                            print(f"Device: {device_id}")
 
                         src_device, resp = transfer._unwrap_response(payload)
                         if len(resp) >= 1:

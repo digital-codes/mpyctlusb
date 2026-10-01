@@ -504,7 +504,7 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                         device_len = payload[0]
                         device_id = payload[1:1+device_len].decode("utf-8", "replace") if device_len > 0 else "unknown"
                         resp_payload = payload[1 + device_len:]
-                        dev_num = device_mgr.add_device(device_id)
+                        device_mgr.add_device(device_id)
                     else:
                         continue
                     peer_idx = None
@@ -512,7 +512,6 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                     peer_idx = payload[0] if len(payload) > 0 else 0
                     device_id = f"peer_{peer_idx}"
                     resp_payload = payload[1:] if len(payload) > 1 else b""
-                    dev_num = peer_idx
 
                 if device_id not in streams:
                     streams[device_id] = DeviceStream(device_id)
@@ -526,7 +525,7 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                         try:
                             packet_id, total_size = parse_handshake(msg_data)
                             stream.start_packet(packet_id, total_size)
-                            print(f"[{dev_num}] HS: pid={packet_id}, size={total_size}")
+                            print(f"[{device_id}] HS: pid={packet_id}, size={total_size}")
                             ack = bytes([packet_id]) + (0).to_bytes(2, "little") + bytes([1])
                             if use_wifi:
                                 resp = bytes([len(device_id)]) + device_id.encode() + bytes([MSG_FILE_ACK]) + ack
@@ -534,7 +533,7 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                                 resp = bytes([peer_idx]) + bytes([MSG_FILE_ACK]) + ack
                             gateway.send(channel, MSG_COMMAND, resp)
                         except Exception as e:
-                            print(f"[{dev_num}] HS error: {e}")
+                            print(f"[{device_id}] HS error: {e}")
 
                     elif msg_type_client == MSG_FILE_DATA:
                         try:
@@ -543,7 +542,7 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                                 data = msg_data[HEADER_SIZE:]
                                 complete = stream.add_segment(packet_id, segment, data)
                                 seg_count = sum(1 for (p, s) in stream.segments if p == packet_id)
-                                print(f"[{dev_num}] DATA: pid={packet_id}, seg={segment}, size={len(data)} ({stream.received_size}/{stream.current_total_size or '?'}) [{seg_count} segs]")
+                                print(f"[{device_id}] DATA: pid={packet_id}, seg={segment}, size={len(data)} ({stream.received_size}/{stream.current_total_size or '?'}) [{seg_count} segs]")
                                 ack = bytes([packet_id]) + segment.to_bytes(2, "little") + bytes([1])
                                 if use_wifi:
                                     resp = bytes([len(device_id)]) + device_id.encode() + bytes([MSG_FILE_ACK]) + ack
@@ -552,16 +551,16 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                                 gateway.send(channel, MSG_COMMAND, resp)
                                 if complete:
                                     completed.append((device_id, packet_id, bytes(stream.completed_data)))
-                                    print(f"[{dev_num}] *** COMPLETE: pid={packet_id}, size={len(stream.completed_data)} ***")
+                                    print(f"[{device_id}] *** COMPLETE: pid={packet_id}, size={len(stream.completed_data)} ***")
                         except Exception as e:
-                            print(f"[{dev_num}] DATA error: {e}")
+                            print(f"[{device_id}] DATA error: {e}")
 
                     elif msg_type_client == MSG_FILE_ACK:
                         if len(msg_data) >= 4:
                             ack_pid = msg_data[0]
                             ack_seg = int.from_bytes(msg_data[1:3], "little")
                             ack_res = msg_data[3]
-                            print(f"[{dev_num}] ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
+                            print(f"[{device_id}] ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
 
         time.sleep(0.1)
 
