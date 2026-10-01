@@ -606,6 +606,11 @@ def main():
         help="Poll for incoming client data"
     )
     parser.add_argument(
+        "-l", "--list",
+        action="store_true",
+        help="List connected WiFi clients"
+    )
+    parser.add_argument(
         "-d", "--device",
         type=str,
         default="sensor1",
@@ -639,9 +644,12 @@ def main():
             print(f"Failed: {msg}")
             return 1
 
-        if args.test:
+        if args.list:
+            print(f"Using channel {target_channel} ({target_name})")
+            list_clients(gateway, args.wifi, device_mgr)
+        elif args.test:
             run_host_test(gateway, use_wifi=args.wifi, use_espnow=args.espnow,
-                        device_id=args.device, peer_index=args.peer)
+                        device_id=args.device)
         elif args.poll:
             poll_for_clients(gateway, use_wifi=args.wifi, use_espnow=args.espnow)
         else:

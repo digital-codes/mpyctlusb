@@ -320,17 +320,17 @@ def check_and_load_channel(gateway, target_channel, target_name):
         return False, "Failed to load channel"
 
 
-def send_test(gateway, channel, use_wifi, peer_index=0, data_size=5000, device_id="sensor1", device_mgr=None):
+def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", device_mgr=None):
     packet_id = 1
     total_size = data_size
     test_data = b"T" * data_size
 
-    print(f"Test params: data_size={data_size}, device_id={device_id}, peer={peer_index}")
+    print(f"Test params: data_size={data_size}, device_id={device_id}")
 
     if use_wifi:
         device_bytes = device_id.encode("utf-8")
         wrapper = bytes([len(device_bytes)]) + device_bytes
-        print(f"Wrapper: device_id={device_id} ({len(device_bytes)} bytes)")
+        print(f"Wrapper: device={device_id} ({len(device_bytes)} bytes)")
     else:
         wrapper = bytes([peer_index])
         print(f"Wrapper: peer_index={peer_index}")
@@ -543,9 +543,9 @@ def main():
     parser.add_argument(
         "-s", "--send",
         type=int,
-        default=5000,
+        default=None,
         metavar="SIZE",
-        help="Send test data of specified size (default: 5000)"
+        help="Send test data of specified size"
     )
     parser.add_argument(
         "-l", "--list",
@@ -562,12 +562,6 @@ def main():
         type=int,
         default=30,
         help="Receive timeout in seconds (default: 30)"
-    )
-    parser.add_argument(
-        "-n", "--peer",
-        type=int,
-        default=0,
-        help="Peer index for ESP-NOW (default: 0)"
     )
     parser.add_argument(
         "-d", "--device",
@@ -598,17 +592,17 @@ def main():
             print(f"Failed: {msg}")
             return 1
 
-        if args.receive:
-            print(f"Using channel {target_channel} ({target_name})")
-            receive_loop(gateway, target_channel, args.wifi, args.timeout, device_mgr)
-        elif args.send:
-            print(f"Using channel {target_channel} ({target_name})")
-            send_test(gateway, target_channel, args.wifi, args.peer, args.send, args.device, device_mgr)
-        elif args.list:
+        if args.list:
             print(f"Using channel {target_channel} ({target_name})")
             list_clients(gateway, args.wifi, device_mgr)
+        elif args.receive:
+            print(f"Using channel {target_channel} ({target_name})")
+            receive_loop(gateway, target_channel, args.wifi, args.timeout, device_mgr)
+        elif args.send is not None:
+            print(f"Using channel {target_channel} ({target_name})")
+            send_test(gateway, target_channel, args.wifi, args.send, args.device, device_mgr)
         else:
-            print("No action specified. Use -s SIZE to send or -r to receive.")
+            print("No action specified. Use -l to list, -r to receive, or -s SIZE to send.")
 
         return 0
 
