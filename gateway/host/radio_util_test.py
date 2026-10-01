@@ -36,6 +36,7 @@ from channel_defs import (
     CHANNEL_ESPNOW,
     CHANNEL_WIFI,
     CTRL_LOAD_CHANNEL,
+    CTRL_GET_WIFI_CLIENTS,
 )
 
 VID = 0x303A
@@ -412,6 +413,46 @@ def send_test(gateway, channel, use_wifi, peer_index=0, data_size=5000, device_i
     return False
 
 
+def list_clients(gateway, use_wifi, device_mgr=None):
+    if device_mgr is None:
+        device_mgr = DeviceManager()
+
+    if not use_wifi:
+        print("Client list only available in WiFi mode")
+        return
+
+    gateway.send(CHANNEL_CONTROL, MSG_COMMAND, bytes([CTRL_GET_WIFI_CLIENTS]))
+
+    start = time.time()
+    while (time.time() - start) < 5:
+        frames = gateway.read(timeout_ms=500)
+        for ch, msg_type, payload in frames:
+            if ch == CHANNEL_CONTROL and msg_type == MSG_STATUS:
+                if len(payload) > 0:
+                    count = payload[0]
+                    print(f"Connected clients ({count}):")
+                    pos = 1
+                    for i in range(count):
+                        if pos >= len(payload):
+                            break
+                        ip_len = payload[pos]
+                        pos += 1
+                        ip = payload[pos:pos + ip_len].decode() if ip_len > 0 else ""
+                        pos += ip_len
+                        if pos >= len(payload):
+                            break
+                        device_len = payload[pos]
+                        pos += 1
+                        device_id = payload[pos:pos + device_len].decode() if device_len > 0 else ""
+                        pos += device_len
+                        device_mgr.add_device(device_id)
+                        print(f"  [{i}] {device_id} ({ip})")
+                return
+        time.sleep(0.1)
+
+    print("No client list received")
+
+
 def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
     if device_mgr is None:
         device_mgr = DeviceManager()
@@ -507,6 +548,11 @@ def main():
         help="Send test data of specified size (default: 5000)"
     )
     parser.add_argument(
+        "-l", "--list",
+        action="store_true",
+        help="List connected WiFi clients"
+    )
+    parser.add_argument(
         "-r", "--receive",
         action="store_true",
         help="Receive mode (wait for incoming data)"
@@ -558,6 +604,9 @@ def main():
         elif args.send:
             print(f"Using channel {target_channel} ({target_name})")
             send_test(gateway, target_channel, args.wifi, args.peer, args.send, args.device, device_mgr)
+        elif args.list:
+            print(f"Using channel {target_channel} ({target_name})")
+            list_clients(gateway, args.wifi, device_mgr)
         else:
             print("No action specified. Use -s SIZE to send or -r to receive.")
 
