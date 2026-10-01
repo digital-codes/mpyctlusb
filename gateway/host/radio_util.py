@@ -463,10 +463,10 @@ def check_and_load_channel(gateway, target_channel, target_name):
         return False, "Failed to load channel"
 
 
-def run_host_test(gateway, use_wifi=False, use_espnow=False):
-    transfer = RadioTransfer(gateway, use_wifi, use_espnow)
+def run_host_test(gateway, use_wifi=False, use_espnow=False, device_id="sensor1", peer_index=0):
+    transfer = RadioTransfer(gateway, use_wifi, use_espnow, device_id=device_id, peer_index=peer_index)
 
-    test_data = b"A" * MAX_PACKET_SIZE
+    test_data = b"A" * 5000
     packet_id = 1
     total_size = len(test_data)
 
@@ -492,11 +492,37 @@ def run_host_test(gateway, use_wifi=False, use_espnow=False):
         print(f"Protocol error: {e}")
 
 
-def poll_for_clients(gateway, use_wifi=False, use_espnow=False):
+class DeviceManager:
+    def __init__(self):
+        self.devices = {}
+        self.next_id = 0
+
+    def add_device(self, device_id):
+        for num, did in self.devices.items():
+            if did == device_id:
+                return num
+        num = self.next_id
+        self.next_id += 1
+        self.devices[num] = device_id
+        return num
+
+    def get_device_id(self, device_num):
+        return self.devices.get(device_num)
+
+    def list_devices(self):
+        return list(self.devices.items())
+
+
+def poll_for_clients(gateway, use_wifi=False, use_espnow=False, device_mgr=None):
+    if device_mgr is None:
+        device_mgr = DeviceManager()
     transfer = RadioTransfer(gateway, use_wifi, use_espnow)
 
     print("Polling for incoming data...")
     print("Press Ctrl+C to exit")
+    print("Use -d <n> to send to device number n (after knowing it from -p output)")
+
+    device_id_map = {}
 
     try:
         while True:
@@ -505,6 +531,16 @@ def poll_for_clients(gateway, use_wifi=False, use_espnow=False):
                 if kind == "frame":
                     channel, msg_type, payload = data
                     if channel == transfer.wireless_channel and msg_type == MSG_EVENT:
+                        device_id = None
+                        if transfer.use_wifi and len(payload) > 1:
+                            device_len = payload[0]
+                            if len(payload) > 1 + device_len:
+                                device_id = payload[1:1+device_len].decode("utf-8", "replace")
+
+                        if device_id:
+                            dev_num = device_mgr.add_device(device_id)
+                            print(f"Device {dev_num}: {device_id}")
+
                         resp = transfer._unwrap_response(payload)
                         if len(resp) >= 1:
                             msg_type_client = resp[0]
@@ -513,25 +549,26 @@ def poll_for_clients(gateway, use_wifi=False, use_espnow=False):
                             if msg_type_client == MSG_FILE_HANDSHAKE:
                                 try:
                                     packet_id, total_size = parse_handshake(msg_data)
-                                    print(f"Received handshake: packet_id={packet_id}, total_size={total_size}")
+                                    print(f"  HS: pid={packet_id}, size={total_size}")
                                     transfer.send_ack(packet_id, 0, 1)
-                                    print("Sent ACK")
+                                    print("  ACK sent")
                                 except Exception as e:
-                                    print(f"Handshake parse error: {e}")
+                                    print(f"  HS error: {e}")
 
                             elif msg_type_client == MSG_FILE_DATA:
                                 if len(msg_data) >= HEADER_SIZE:
                                     packet_id, segment = parse_header(msg_data[:HEADER_SIZE])
-                                    data = msg_data[HEADER_SIZE:]
-                                    print(f"Received data: packet_id={packet_id}, segment={segment}, size={len(data)}")
+                                    recv_data = msg_data[HEADER_SIZE:]
+                                    print(f"  DATA: pid={packet_id}, seg={segment}, size={len(recv_data)}")
                                     transfer.send_ack(packet_id, segment, 1)
+                                    print("  ACK sent")
 
                             elif msg_type_client == MSG_FILE_ACK:
                                 if len(msg_data) >= 4:
                                     ack_packet_id = msg_data[0]
                                     ack_segment = int.from_bytes(msg_data[1:3], "little")
                                     ack_result = msg_data[3]
-                                    print(f"Received ACK: packet_id={ack_packet_id}, segment={ack_segment}, result={ack_result}")
+                                    print(f"  ACK: pid={ack_packet_id}, seg={ack_segment}, result={ack_result}")
 
                 elif kind == "error":
                     print(f"Error: {data}")
@@ -568,6 +605,18 @@ def main():
         action="store_true",
         help="Poll for incoming client data"
     )
+    parser.add_argument(
+        "-d", "--device",
+        type=str,
+        default="sensor1",
+        help="Device ID for WiFi (default: sensor1)"
+    )
+    parser.add_argument(
+        "-n", "--peer",
+        type=int,
+        default=0,
+        help="Peer index for ESP-NOW (default: 0)"
+    )
     args = parser.parse_args()
 
     if args.espnow and args.wifi:
@@ -591,7 +640,8 @@ def main():
             return 1
 
         if args.test:
-            run_host_test(gateway, use_wifi=args.wifi, use_espnow=args.espnow)
+            run_host_test(gateway, use_wifi=args.wifi, use_espnow=args.espnow,
+                        device_id=args.device, peer_index=args.peer)
         elif args.poll:
             poll_for_clients(gateway, use_wifi=args.wifi, use_espnow=args.espnow)
         else:

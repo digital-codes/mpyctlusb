@@ -88,6 +88,27 @@ class FrameParser:
         return frames
 
 
+class DeviceManager:
+    def __init__(self):
+        self.devices = {}
+        self.next_id = 0
+
+    def add_device(self, device_id):
+        for num, did in self.devices.items():
+            if did == device_id:
+                return num
+        num = self.next_id
+        self.next_id += 1
+        self.devices[num] = device_id
+        return num
+
+    def get_device_id(self, device_num):
+        return self.devices.get(device_num)
+
+    def list_devices(self):
+        return list(self.devices.items())
+
+
 class USBGateway:
     def __init__(self, serial=None, timeout_ms=100):
         self.serial = serial
@@ -296,21 +317,33 @@ def check_and_load_channel(gateway, target_channel, target_name):
         return False, "Failed to load channel"
 
 
-def send_test(gateway, channel, use_wifi, peer_index=0, data_size=1024):
+def send_test(gateway, channel, use_wifi, peer_index=0, data_size=5000, device_num=0, device_mgr=None):
     packet_id = 1
     total_size = data_size
     test_data = b"T" * data_size
 
+    if device_mgr is None:
+        device_mgr = DeviceManager()
+
+    device_id = device_mgr.get_device_id(device_num)
+    if device_id is None:
+        print(f"Error: No device registered at number {device_num}")
+        print(f"Known devices: {device_mgr.list_devices()}")
+        return False
+
+    print(f"Test params: data_size={data_size}, device_num={device_num}, device_id={device_id}, peer={peer_index}")
+
     if use_wifi:
-        device_id = "sensor1"
         device_bytes = device_id.encode("utf-8")
         wrapper = bytes([len(device_bytes)]) + device_bytes
+        print(f"Wrapper: device_id={device_id} ({len(device_bytes)} bytes)")
     else:
         wrapper = bytes([peer_index])
+        print(f"Wrapper: peer_index={peer_index}")
 
     handshake_payload = encode_handshake(packet_id, total_size)
     full_payload = wrapper + bytes([MSG_FILE_HANDSHAKE]) + handshake_payload
-    print(f"Sending handshake: packet_id={packet_id}, total_size={total_size}")
+    print(f"Sending handshake: packet_id={packet_id}, total_size={total_size}, payload_len={len(full_payload)}")
     gateway.send(channel, MSG_COMMAND, full_payload)
 
     start = time.time()
@@ -386,7 +419,9 @@ def send_test(gateway, channel, use_wifi, peer_index=0, data_size=1024):
     return False
 
 
-def receive_loop(gateway, channel, use_wifi, timeout=30):
+def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
+    if device_mgr is None:
+        device_mgr = DeviceManager()
     print(f"Waiting for incoming data on channel {channel}...")
     print(f"Timeout: {timeout} seconds")
 
@@ -400,7 +435,8 @@ def receive_loop(gateway, channel, use_wifi, timeout=30):
                         device_len = payload[0]
                         device_id = payload[1:1+device_len].decode("utf-8", "replace") if device_len > 0 else "unknown"
                         resp_payload = payload[1 + device_len:]
-                        print(f"From device: {device_id}")
+                        dev_num = device_mgr.add_device(device_id)
+                        print(f"=== From device {dev_num}: {device_id} ===")
                     else:
                         continue
                 else:
@@ -473,8 +509,9 @@ def main():
     parser.add_argument(
         "-s", "--send",
         type=int,
+        default=5000,
         metavar="SIZE",
-        help="Send test data of specified size"
+        help="Send test data of specified size (default: 5000)"
     )
     parser.add_argument(
         "-r", "--receive",
@@ -493,6 +530,12 @@ def main():
         default=0,
         help="Peer index for ESP-NOW (default: 0)"
     )
+    parser.add_argument(
+        "-d", "--device",
+        type=int,
+        default=0,
+        help="Device number for WiFi (default: 0)"
+    )
     args = parser.parse_args()
 
     if args.espnow and args.wifi:
@@ -502,6 +545,7 @@ def main():
         raise SystemExit("Error: must specify either -e (espnow) or -w (wifi)")
 
     gateway = USBGateway(serial=args.serial)
+    device_mgr = DeviceManager()
 
     try:
         gateway.open()
@@ -517,10 +561,10 @@ def main():
 
         if args.receive:
             print(f"Using channel {target_channel} ({target_name})")
-            receive_loop(gateway, target_channel, args.wifi, args.timeout)
+            receive_loop(gateway, target_channel, args.wifi, args.timeout, device_mgr)
         elif args.send:
             print(f"Using channel {target_channel} ({target_name})")
-            send_test(gateway, target_channel, args.wifi, args.peer, args.send)
+            send_test(gateway, target_channel, args.wifi, args.peer, args.send, args.device, device_mgr)
         else:
             print("No action specified. Use -s SIZE to send or -r to receive.")
 
