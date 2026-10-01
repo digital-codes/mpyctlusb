@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
 from channel_defs import (
     MSG_COMMAND,
     MSG_EVENT,
+    MSG_PEER_ADD,
+    MSG_PEER_DEL,
     MSG_CHANNEL_LIST_REQUEST,
     MSG_CHANNEL_LIST_RESPONSE,
     MSG_ERROR,
@@ -113,6 +115,57 @@ class DeviceManager:
 
     def list_devices(self):
         return list(self.devices.items())
+
+
+PEERS_PATH = os.path.join(os.path.dirname(__file__), "..", "stick", "peers.json")
+
+
+class PeerManager:
+    """Loads peers.json, registers them with ESP-NOW server, maps device_id -> peer_index."""
+
+    def __init__(self):
+        self.peers = []
+        self.device_to_index = {}
+
+    def load(self):
+        try:
+            peers_path = os.path.normpath(PEERS_PATH)
+            if os.path.exists(peers_path):
+                with open(peers_path, "r") as f:
+                    self.peers = json.load(f)
+                print(f"Loaded {len(self.peers)} peers from {peers_path}")
+            else:
+                print(f"Peers file not found: {peers_path}")
+                self.peers = []
+        except Exception as e:
+            print(f"Failed to load peers: {e}")
+            self.peers = []
+
+    def register_with_device(self, gateway):
+        """Send MSG_PEER_ADD for each peer so ESP-NOW server knows about them."""
+        if not self.peers:
+            return
+        for peer in self.peers:
+            try:
+                mac_hex = peer.get("mac", "")
+                lmk_hex = peer.get("lmk", "")
+                if not mac_hex:
+                    continue
+                mac = bytes.fromhex(mac_hex)
+                lmk = bytes.fromhex(lmk_hex) if lmk_hex else None
+                payload = mac
+                if lmk:
+                    payload += lmk
+                gateway.send(CHANNEL_ESPNOW, MSG_PEER_ADD, payload)
+                print(f"Sent peer_add for {mac_hex}")
+            except Exception as e:
+                print(f"Failed to send peer_add for {peer.get('mac')}: {e}")
+
+    def get_index(self, device_id):
+        for idx, peer in enumerate(self.peers):
+            if peer.get("device") == device_id:
+                return idx
+        return None
 
 
 class USBGateway:
@@ -323,7 +376,7 @@ def check_and_load_channel(gateway, target_channel, target_name):
         return False, "Failed to load channel"
 
 
-def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", device_mgr=None):
+def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", device_mgr=None, peer_mgr=None):
     packet_id = 1
     total_size = data_size
     test_data = b"T" * data_size
@@ -331,15 +384,20 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", d
     MAX_SEGMENT_SIZE = 900
     num_segments = (total_size + MAX_SEGMENT_SIZE - 1) // MAX_SEGMENT_SIZE
 
-    print(f"Test params: data_size={data_size}, segments={num_segments}, device_id={device_id}")
-
+    peer_index = 0
     if use_wifi:
         device_bytes = device_id.encode("utf-8")
         wrapper = bytes([len(device_bytes)]) + device_bytes
-        print(f"Wrapper: device={device_id} ({len(device_bytes)} bytes)")
+        print(f"Test params: data_size={data_size}, segments={num_segments}, device={device_id}")
     else:
+        if peer_mgr is not None:
+            idx = peer_mgr.get_index(device_id)
+            if idx is None:
+                print(f"Error: device '{device_id}' not in peers.json")
+                return False
+            peer_index = idx
         wrapper = bytes([peer_index])
-        print(f"Wrapper: peer_index={peer_index}")
+        print(f"Test params: data_size={data_size}, segments={num_segments}, device={device_id}, peer_index={peer_index}")
 
     handshake_payload = encode_handshake(packet_id, total_size)
     full_payload = wrapper + bytes([MSG_FILE_HANDSHAKE]) + handshake_payload
@@ -670,7 +728,7 @@ def main():
             receive_loop(gateway, target_channel, args.wifi, args.timeout, device_mgr)
         elif args.send is not None:
             print(f"Using channel {target_channel} ({target_name})")
-            ok = send_test(gateway, target_channel, args.wifi, args.send, args.device, device_mgr)
+            ok = send_test(gateway, target_channel, args.wifi, args.send, args.device, args.peer, device_mgr)
             if not ok:
                 return 1
         else:
