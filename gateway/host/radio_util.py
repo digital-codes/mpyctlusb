@@ -53,6 +53,7 @@ from channel_defs import (
     CHANNEL_WIFI,
     CTRL_LOAD_CHANNEL,
     CTRL_RESET,
+    CTRL_GET_WIFI_CLIENTS,
 )
 
 VID = 0x303A
@@ -305,14 +306,16 @@ class RadioTransfer:
             return bytes([self.peer_index]) + bytes([protocol_msg_type]) + data
 
     def _unwrap_response(self, payload):
+        """Returns (src_device, response_payload). For ESP-NOW src_device is None."""
         if self.use_wifi:
             if len(payload) > 1:
                 device_len = payload[0]
                 if len(payload) > 1 + device_len:
-                    return payload[1 + device_len:]
-            return b""
+                    src_device = payload[1:1 + device_len].decode("utf-8", "replace")
+                    return src_device, payload[1 + device_len:]
+            return None, b""
         else:
-            return payload[1:] if len(payload) > 1 else b""
+            return None, payload[1:] if len(payload) > 1 else b""
 
     def send_handshake(self, packet_id, total_size):
         payload = encode_handshake(packet_id, total_size)
@@ -333,7 +336,9 @@ class RadioTransfer:
                 if kind == "frame":
                     channel, msg_type, payload = data
                     if channel == self.wireless_channel and msg_type == MSG_EVENT:
-                        resp = self._unwrap_response(payload)
+                        src_device, resp = self._unwrap_response(payload)
+                        if self.use_wifi and src_device != self.device_id:
+                            continue
                         if len(resp) >= 4 and resp[0] == MSG_FILE_ACK:
                             ack_packet_id = resp[1]
                             ack_segment = int.from_bytes(resp[2:4], "little")
@@ -350,7 +355,9 @@ class RadioTransfer:
                 if kind == "frame":
                     channel, msg_type, payload = data
                     if channel == self.wireless_channel and msg_type == MSG_EVENT:
-                        resp = self._unwrap_response(payload)
+                        src_device, resp = self._unwrap_response(payload)
+                        if self.use_wifi and src_device != self.device_id:
+                            continue
                         if len(resp) >= 5 and resp[0] == MSG_FILE_HANDSHAKE:
                             return parse_handshake(resp[1:])
             time.sleep(0.01)
@@ -364,7 +371,9 @@ class RadioTransfer:
                 if kind == "frame":
                     channel, msg_type, payload = data
                     if channel == self.wireless_channel and msg_type == MSG_EVENT:
-                        resp = self._unwrap_response(payload)
+                        src_device, resp = self._unwrap_response(payload)
+                        if self.use_wifi and src_device != self.device_id:
+                            continue
                         if len(resp) >= 3 and resp[0] == MSG_FILE_DATA:
                             if len(resp) >= 1 + HEADER_SIZE:
                                 packet_id, segment = parse_header(resp[1:1+HEADER_SIZE])
@@ -513,6 +522,113 @@ class DeviceManager:
         return list(self.devices.items())
 
 
+class DeviceStream:
+    """Per-device receive state: handshake info, segment buffer, completed data."""
+
+    def __init__(self, device_id):
+        self.device_id = device_id
+        self.current_packet_id = None
+        self.current_total_size = None
+        self.received_size = 0
+        self.segments = {}
+        self.completed_data = bytearray()
+        self.last_activity = time.time()
+
+    def start_packet(self, packet_id, total_size):
+        self.current_packet_id = packet_id
+        self.current_total_size = total_size
+        self.received_size = 0
+        self.segments = {}
+        self.completed_data = bytearray()
+        self.last_activity = time.time()
+
+    def add_segment(self, packet_id, segment, data):
+        self.last_activity = time.time()
+        if self.current_packet_id != packet_id:
+            self.start_packet(packet_id, None)
+        key = (packet_id, segment)
+        if key in self.segments:
+            return False
+        self.segments[key] = data
+        self.received_size += len(data)
+        if self.current_total_size and self.received_size >= self.current_total_size:
+            self._assemble(packet_id)
+            return True
+        return False
+
+    def _assemble(self, packet_id):
+        seg_list = sorted([(seg, data) for (pid, seg), data in self.segments.items() if pid == packet_id])
+        self.completed_data = bytearray()
+        for _, data in seg_list:
+            self.completed_data.extend(data)
+
+    def is_complete(self, packet_id):
+        return self.current_packet_id == packet_id and self.completed_data is not None and len(self.completed_data) >= (self.current_total_size or 0)
+
+
+def _parse_wifi_clients(payload, device_mgr):
+    """Reuse TUI parsing logic for WiFi client list response."""
+    if not payload:
+        return
+    try:
+        count = payload[0]
+        pos = 1
+        synced = []
+        for _ in range(count):
+            if pos >= len(payload):
+                break
+            ip_len = payload[pos]
+            pos += 1
+            ip = payload[pos:pos + ip_len].decode()
+            pos += ip_len
+            if pos >= len(payload):
+                break
+            device_len = payload[pos]
+            pos += 1
+            device = payload[pos:pos + device_len].decode()
+            pos += device_len
+            if pos >= len(payload):
+                break
+            mac_len = payload[pos]
+            pos += 1
+            pos += mac_len
+            synced.append(device if device else ip)
+
+        print(f"Connected clients ({count}):")
+        for dev in synced:
+            dev_num = device_mgr.add_device(dev)
+            print(f"  [{dev_num}] {dev}")
+    except Exception as e:
+        print(f"Parse error: {e}")
+
+
+def list_clients(gateway, use_wifi, device_mgr=None):
+    if device_mgr is None:
+        device_mgr = DeviceManager()
+
+    if not use_wifi:
+        print("Client list only available in WiFi mode")
+        return
+
+    gateway.send(CHANNEL_CONTROL, MSG_COMMAND, bytes([CTRL_GET_WIFI_CLIENTS]))
+    print("Requesting client list...")
+
+    start = time.time()
+    while (time.time() - start) < 3:
+        frames = gateway.drain_events(timeout=0.3)
+        for kind, data in frames:
+            if kind == "frame":
+                ch, msg_type, payload = data
+                if ch == CHANNEL_CONTROL and msg_type == MSG_STATUS:
+                    # Same heuristic as TUI: 28 bytes with first byte 0/1 = gateway status
+                    if len(payload) == 28 and payload[0] in (0, 1):
+                        continue
+                    _parse_wifi_clients(payload, device_mgr)
+                    return
+
+    print("No client list received")
+
+
 def poll_for_clients(gateway, use_wifi=False, use_espnow=False, device_mgr=None):
     if device_mgr is None:
         device_mgr = DeviceManager()
@@ -541,7 +657,7 @@ def poll_for_clients(gateway, use_wifi=False, use_espnow=False, device_mgr=None)
                             dev_num = device_mgr.add_device(device_id)
                             print(f"Device {dev_num}: {device_id}")
 
-                        resp = transfer._unwrap_response(payload)
+                        src_device, resp = transfer._unwrap_response(payload)
                         if len(resp) >= 1:
                             msg_type_client = resp[0]
                             msg_data = resp[1:]

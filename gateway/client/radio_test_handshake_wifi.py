@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # radio_test_handshake_wifi.py
 #
-# MicroPython WiFi client: sends handshake + data packet, waits for echo.
+# MicroPython WiFi client: sends handshake + segmented data, waits for echoes.
 # Auto-runs on import (no CLI args, suitable for mpremote).
 #
 # Usage:
@@ -25,10 +25,11 @@ MSG_FILE_DATA = 0x31
 MSG_FILE_ACK = 0x32
 
 PACKET_SIZE = 5000
+MAX_SEGMENT_SIZE = 1024
 
 
-def get_header(packet_id, segment):
-    return bytes([((packet_id << 4) & 0xF0) | ((segment >> 8) & 0x0F), segment & 0x0F])
+def make_header(packet_id, segment):
+    return bytes([((packet_id << 4) & 0xF0) | ((segment >> 8) & 0x0F), segment & 0xFF])
 
 
 def parse_header(header):
@@ -71,11 +72,14 @@ def main():
         time.sleep(1)
     try:
         wlan.config(channel=WIFI_CHANNEL)
+    except Exception:
+        pass
+    try:
         wlan.config(pm=wlan.PM_NONE)
     except Exception:
         pass
 
-    print("Connecting to WiFi...")
+    print("Connecting to WiFi AP...")
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
     while not wlan.isconnected():
         time.sleep(1)
@@ -90,11 +94,14 @@ def main():
 
     packet_id = 1
     test_data = b"D" * PACKET_SIZE
+    num_segments = (len(test_data) + MAX_SEGMENT_SIZE - 1) // MAX_SEGMENT_SIZE
+    print(f"Packet: pid={packet_id}, size={PACKET_SIZE}, segments={num_segments}")
 
-    print(f"Sending handshake: pid={packet_id}, size={PACKET_SIZE}")
+    print("Sending handshake...")
     payload = bytes([MSG_FILE_HANDSHAKE]) + encode_handshake(packet_id, PACKET_SIZE)
     sock.send(payload)
 
+    rx_buffer = b""
     ack_received = False
     start = time.time()
     while not ack_received and (time.time() - start) < 5:
@@ -102,16 +109,27 @@ def main():
             sock.setblocking(False)
             data = sock.recv(4096)
             if data:
-                msg_type = data[0]
-                msg_data = data[1:]
-                if msg_type == MSG_FILE_ACK:
-                    result = parse_ack(msg_data)
-                    if result:
-                        ack_pid, ack_seg, ack_res = result
-                        print(f"ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
-                        ack_received = True
+                rx_buffer += data
         except OSError:
             pass
+
+        while len(rx_buffer) >= 1:
+            msg_type = rx_buffer[0]
+            if msg_type == MSG_FILE_ACK:
+                payload = rx_buffer[1:]
+                if len(payload) < 4:
+                    break
+                result = parse_ack(payload[:5] if len(payload) >= 5 else payload)
+                if result:
+                    ack_pid, ack_seg, ack_res = result
+                    print(f"ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
+                    ack_received = True
+                    rx_buffer = b""
+                    break
+            else:
+                rx_buffer = b""
+                break
+
         time.sleep(0.05)
 
     if not ack_received:
@@ -119,34 +137,63 @@ def main():
         sock.close()
         return
 
-    print("Sending data packet...")
-    payload = bytes([MSG_FILE_DATA]) + get_header(packet_id, 0) + test_data
-    sock.send(payload)
+    print(f"Sending {num_segments} data segments...")
+    for seg in range(num_segments):
+        start_byte = seg * MAX_SEGMENT_SIZE
+        end_byte = min(start_byte + MAX_SEGMENT_SIZE, len(test_data))
+        segment_data = test_data[start_byte:end_byte]
+        payload = bytes([MSG_FILE_DATA]) + make_header(packet_id, seg) + segment_data
+        sock.send(payload)
+        print(f"  Sent seg={seg}, size={len(segment_data)}")
 
-    echo_received = False
+    print("Waiting for echoes...")
+    echoed_segments = {}
     start = time.time()
-    while not echo_received and (time.time() - start) < 5:
+    while len(echoed_segments) < num_segments and (time.time() - start) < 10:
         try:
             sock.setblocking(False)
             data = sock.recv(4096)
             if data:
-                msg_type = data[0]
-                msg_data = data[1:]
-                if msg_type == MSG_FILE_DATA and len(msg_data) >= 2:
-                    recv_pid, recv_seg = parse_header(msg_data[:2])
-                    recv_data = msg_data[2:]
-                    print(f"Echo: pid={recv_pid}, seg={recv_seg}, size={len(recv_data)}")
-                    if recv_data == test_data:
-                        print("Data integrity verified!")
-                        echo_received = True
-                    else:
-                        print(f"Data mismatch! Expected {PACKET_SIZE}, got {len(recv_data)}")
+                rx_buffer += data
         except OSError:
             pass
+
+        while len(rx_buffer) >= 3:
+            msg_type = rx_buffer[0]
+            if msg_type == MSG_FILE_DATA:
+                payload = rx_buffer[1:]
+                if len(payload) < 2:
+                    break
+                recv_pid, recv_seg = parse_header(payload[:2])
+                recv_data = payload[2:]
+                if recv_pid == packet_id and recv_seg not in echoed_segments:
+                    echoed_segments[recv_seg] = recv_data
+                    print(f"  Echo: seg={recv_seg}, size={len(recv_data)}")
+                rx_buffer = b""
+            elif msg_type == MSG_FILE_ACK:
+                payload = rx_buffer[1:]
+                if len(payload) >= 4:
+                    result = parse_ack(payload[:5] if len(payload) >= 5 else payload)
+                    if result:
+                        print(f"  ACK: seg={result[1]}, result={result[2]}")
+                rx_buffer = b""
+            else:
+                rx_buffer = b""
+                break
+
         time.sleep(0.05)
 
-    if not echo_received:
-        print("No echo received")
+    print(f"Received {len(echoed_segments)}/{num_segments} echoes")
+    for seg in range(num_segments):
+        if seg not in echoed_segments:
+            print(f"  Missing seg={seg}")
+        else:
+            start_byte = seg * MAX_SEGMENT_SIZE
+            end_byte = min(start_byte + MAX_SEGMENT_SIZE, len(test_data))
+            expected = test_data[start_byte:end_byte]
+            if echoed_segments[seg] != expected:
+                print(f"  Mismatch seg={seg}")
+
     sock.close()
 
 

@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # radio_test_echo_wifi.py
 #
-# MicroPython WiFi client: echo server for file transfer tests.
-# Listens on port 8081, receives handshake/data and responds with ACK + echo.
+# MicroPython WiFi client: connects to server, identifies, then echoes data.
 # Auto-runs on import (no CLI args, suitable for mpremote).
 #
 # Usage:
 #   mpremote run client/radio_test_echo_wifi.py
 #
-# Note: This connects TO the WiFi AP and opens port 8081 as a server to receive
-# commands from the host. The host must send to this client.
+# Protocol:
+#   - Client connects to server's WiFi AP on port 8080
+#   - Sends identification: ID_MARKER (0x00) + device_id
+#   - Waits for incoming handshake/data OR can send its own
+#   - On receive: sends ACK, then echoes the data back (with corrected segment)
 
 import time
 import json
@@ -21,6 +23,8 @@ import private as pr
 WIFI_SSID = pr.WIFI_SSID
 WIFI_PASSWORD = pr.WIFI_PASSWORD
 WIFI_CHANNEL = pr.WIFI_CHANNEL
+SERVER_PORT = 8080
+ID_MARKER = b"\x00"
 
 MSG_FILE_HANDSHAKE = 0x30
 MSG_FILE_DATA = 0x31
@@ -40,8 +44,12 @@ def parse_header(header):
     return packet_id, segment
 
 
+def make_header(packet_id, segment):
+    return bytes([((packet_id << 4) & 0xF0) | ((segment >> 8) & 0x0F), segment & 0xFF])
+
+
 def main():
-    print("WiFi echo server client")
+    print("WiFi echo client")
     print("SSID:", WIFI_SSID)
     print("Channel:", WIFI_CHANNEL)
 
@@ -69,87 +77,77 @@ def main():
     except Exception:
         pass
 
-    print("Connecting to WiFi...")
+    print("Connecting to WiFi AP...")
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
     while not wlan.isconnected():
         time.sleep(1)
 
     print("Connected! IP:", wlan.ifconfig()[0])
+    SERVER_IP = wlan.ifconfig()[2]
+    print("Server IP:", SERVER_IP)
 
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(("0.0.0.0", 8081))
-    server_sock.listen(1)
-    server_sock.settimeout(0)
-    print("Listening on port 8081...")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((SERVER_IP, SERVER_PORT))
+    sock.settimeout(0)
+    sock.send(ID_MARKER + DEVICE_ID.encode("utf-8"))
+    print(f"Identified as '{DEVICE_ID}'. Echo mode running. Press Ctrl+C to exit.")
 
-    clients = []
-
-    print("Echo server running. Press Ctrl+C to exit.")
-
+    rx_buffer = b""
     try:
         while True:
             try:
-                cl, addr = server_sock.accept()
-                cl.settimeout(0)
-                clients.append(cl)
-                print(f"Client connected: {addr}")
+                sock.setblocking(False)
+                data = sock.recv(4096)
+                if not data:
+                    print("Connection closed by server")
+                    break
+                rx_buffer += data
             except OSError:
                 pass
 
-            for cl in clients[:]:
-                try:
-                    cl.setblocking(False)
-                    data = cl.recv(4096)
-                    if data:
-                        if len(data) >= 1:
-                            msg_type = data[0]
-                            payload = data[1:]
+            while len(rx_buffer) >= 1:
+                msg_type = rx_buffer[0]
 
-                            if msg_type == MSG_FILE_HANDSHAKE:
-                                try:
-                                    packet_id, total_size = parse_handshake(payload)
-                                    print(f"HS: pid={packet_id}, size={total_size}")
-                                    ack = bytes([MSG_FILE_ACK]) + bytes([packet_id]) + (0).to_bytes(2, "little") + bytes([1])
-                                    cl.send(ack)
-                                    print("  ACK sent")
-                                except Exception as e:
-                                    print(f"HS error: {e}")
+                if msg_type == MSG_FILE_HANDSHAKE:
+                    payload = rx_buffer[1:]
+                    if len(payload) < 5:
+                        break
+                    packet_id, total_size = parse_handshake(payload[:5])
+                    print(f"HS: pid={packet_id}, size={total_size}")
+                    ack = bytes([MSG_FILE_ACK]) + bytes([packet_id]) + (0).to_bytes(2, "little") + bytes([1])
+                    sock.send(ack)
+                    print("  ACK sent")
+                    rx_buffer = b""
 
-                            elif msg_type == MSG_FILE_DATA:
-                                try:
-                                    if len(payload) >= 2:
-                                        packet_id, segment = parse_header(payload[:2])
-                                        recv_data = payload[2:]
-                                        print(f"DATA: pid={packet_id}, seg={segment}, size={len(recv_data)}")
-                                        ack = bytes([MSG_FILE_ACK]) + bytes([packet_id]) + segment.to_bytes(2, "little") + bytes([1])
-                                        cl.send(ack)
-                                        print("  ACK sent")
-                                        echo = bytes([MSG_FILE_DATA]) + payload
-                                        cl.send(echo)
-                                        print("  Echo sent")
-                                except Exception as e:
-                                    print(f"DATA error: {e}")
+                elif msg_type == MSG_FILE_DATA:
+                    payload = rx_buffer[1:]
+                    if len(payload) < 2:
+                        break
+                    packet_id, segment = parse_header(payload[:2])
+                    recv_data = payload[2:]
+                    print(f"DATA: pid={packet_id}, seg={segment}, size={len(recv_data)}")
+                    ack = bytes([MSG_FILE_ACK]) + bytes([packet_id]) + segment.to_bytes(2, "little") + bytes([1])
+                    sock.send(ack)
+                    echo = bytes([MSG_FILE_DATA]) + make_header(packet_id, segment) + recv_data
+                    sock.send(echo)
+                    print(f"  ACK + echo sent (seg={segment}, size={len(recv_data)})")
+                    rx_buffer = b""
 
-                    else:
-                        cl.close()
-                        clients.remove(cl)
-                except OSError:
-                    pass
-                except Exception as e:
-                    try:
-                        cl.close()
-                        clients.remove(cl)
-                    except Exception:
-                        pass
+                else:
+                    print(f"Unknown msg_type: {msg_type}")
+                    rx_buffer = b""
 
-            time.sleep(0.1)
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("\nExiting")
-        for cl in clients:
-            cl.close()
-        server_sock.close()
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
 main()

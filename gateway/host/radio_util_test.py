@@ -39,6 +39,9 @@ from channel_defs import (
     CTRL_GET_WIFI_CLIENTS,
 )
 
+sys.path.insert(0, os.path.dirname(__file__))
+from radio_util import DeviceManager, DeviceStream, get_header, parse_header, encode_handshake, parse_handshake, HEADER_SIZE
+
 VID = 0x303A
 PID = 0x4001
 INTERFACE = 2
@@ -350,13 +353,19 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", d
                     if len(payload) > 1:
                         device_len = payload[0]
                         if len(payload) > 1 + device_len:
+                            src_device = payload[1:1 + device_len].decode("utf-8", "replace")
                             resp_payload = payload[1 + device_len:]
                         else:
                             continue
                     else:
                         continue
                 else:
+                    src_device = None
                     resp_payload = payload[1:] if len(payload) > 1 else b""
+
+                if use_wifi and src_device != device_id:
+                    print(f"  Ignoring ACK from device '{src_device}' (waiting for '{device_id}')")
+                    continue
 
                 if len(resp_payload) >= 5 and resp_payload[0] == MSG_FILE_ACK:
                     ack_pid = resp_payload[1]
@@ -388,13 +397,19 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", d
                     if len(payload) > 1:
                         device_len = payload[0]
                         if len(payload) > 1 + device_len:
+                            src_device = payload[1:1 + device_len].decode("utf-8", "replace")
                             resp_payload = payload[1 + device_len:]
                         else:
                             continue
                     else:
                         continue
                 else:
+                    src_device = None
                     resp_payload = payload[1:] if len(payload) > 1 else b""
+
+                if use_wifi and src_device != device_id:
+                    print(f"  Ignoring echo from device '{src_device}' (waiting for '{device_id}')")
+                    continue
 
                 if len(resp_payload) >= 3 and resp_payload[0] == MSG_FILE_DATA:
                     if len(resp_payload) >= HEADER_SIZE + 1:
@@ -422,35 +437,52 @@ def list_clients(gateway, use_wifi, device_mgr=None):
         return
 
     gateway.send(CHANNEL_CONTROL, MSG_COMMAND, bytes([CTRL_GET_WIFI_CLIENTS]))
+    print("Requesting client list...")
 
     start = time.time()
-    while (time.time() - start) < 5:
-        frames = gateway.read(timeout_ms=500)
+    while (time.time() - start) < 3:
+        frames = gateway.read(timeout_ms=300)
         for ch, msg_type, payload in frames:
             if ch == CHANNEL_CONTROL and msg_type == MSG_STATUS:
-                if len(payload) > 0:
-                    count = payload[0]
-                    print(f"Connected clients ({count}):")
-                    pos = 1
-                    for i in range(count):
-                        if pos >= len(payload):
-                            break
-                        ip_len = payload[pos]
-                        pos += 1
-                        ip = payload[pos:pos + ip_len].decode() if ip_len > 0 else ""
-                        pos += ip_len
-                        if pos >= len(payload):
-                            break
-                        device_len = payload[pos]
-                        pos += 1
-                        device_id = payload[pos:pos + device_len].decode() if device_len > 0 else ""
-                        pos += device_len
-                        device_mgr.add_device(device_id)
-                        print(f"  [{i}] {device_id} ({ip})")
+                # Reuse TUI logic: 28 bytes with first byte 0/1 = gateway status
+                if len(payload) == 28 and payload[0] in (0, 1):
+                    continue
+                # Otherwise it's the WiFi client list
+                _parse_wifi_clients(payload, device_mgr)
                 return
-        time.sleep(0.1)
 
     print("No client list received")
+
+
+def _parse_wifi_clients(payload, device_mgr):
+    if not payload:
+        return
+    try:
+        count = payload[0]
+        pos = 1
+        print(f"Connected clients ({count}):")
+        for i in range(count):
+            if pos >= len(payload):
+                break
+            ip_len = payload[pos]
+            pos += 1
+            ip = payload[pos:pos + ip_len].decode()
+            pos += ip_len
+            if pos >= len(payload):
+                break
+            device_len = payload[pos]
+            pos += 1
+            device = payload[pos:pos + device_len].decode()
+            pos += device_len
+            if pos >= len(payload):
+                break
+            mac_len = payload[pos]
+            pos += 1
+            pos += mac_len
+            dev_num = device_mgr.add_device(device)
+            print(f"  [{dev_num}] {device} ({ip})")
+    except Exception as e:
+        print(f"Parse error: {e}")
 
 
 def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
@@ -458,6 +490,9 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
         device_mgr = DeviceManager()
     print(f"Waiting for incoming data on channel {channel}...")
     print(f"Timeout: {timeout} seconds")
+
+    streams = {}
+    completed = []
 
     start = time.time()
     while (time.time() - start) < timeout:
@@ -470,13 +505,18 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                         device_id = payload[1:1+device_len].decode("utf-8", "replace") if device_len > 0 else "unknown"
                         resp_payload = payload[1 + device_len:]
                         dev_num = device_mgr.add_device(device_id)
-                        print(f"=== From device {dev_num}: {device_id} ===")
                     else:
                         continue
+                    peer_idx = None
                 else:
                     peer_idx = payload[0] if len(payload) > 0 else 0
+                    device_id = f"peer_{peer_idx}"
                     resp_payload = payload[1:] if len(payload) > 1 else b""
-                    print(f"From peer index: {peer_idx}")
+                    dev_num = peer_idx
+
+                if device_id not in streams:
+                    streams[device_id] = DeviceStream(device_id)
+                stream = streams[device_id]
 
                 if len(resp_payload) >= 1:
                     msg_type_client = resp_payload[0]
@@ -485,43 +525,51 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                     if msg_type_client == MSG_FILE_HANDSHAKE:
                         try:
                             packet_id, total_size = parse_handshake(msg_data)
-                            print(f"  HS: pid={packet_id}, size={total_size}")
+                            stream.start_packet(packet_id, total_size)
+                            print(f"[{dev_num}] HS: pid={packet_id}, size={total_size}")
                             ack = bytes([packet_id]) + (0).to_bytes(2, "little") + bytes([1])
                             if use_wifi:
                                 resp = bytes([len(device_id)]) + device_id.encode() + bytes([MSG_FILE_ACK]) + ack
                             else:
                                 resp = bytes([peer_idx]) + bytes([MSG_FILE_ACK]) + ack
                             gateway.send(channel, MSG_COMMAND, resp)
-                            print("  ACK sent")
                         except Exception as e:
-                            print(f"  HS error: {e}")
+                            print(f"[{dev_num}] HS error: {e}")
 
                     elif msg_type_client == MSG_FILE_DATA:
                         try:
                             if len(msg_data) >= HEADER_SIZE:
                                 packet_id, segment = parse_header(msg_data[:HEADER_SIZE])
                                 data = msg_data[HEADER_SIZE:]
-                                print(f"  DATA: pid={packet_id}, seg={segment}, size={len(data)}")
+                                complete = stream.add_segment(packet_id, segment, data)
+                                seg_count = sum(1 for (p, s) in stream.segments if p == packet_id)
+                                print(f"[{dev_num}] DATA: pid={packet_id}, seg={segment}, size={len(data)} ({stream.received_size}/{stream.current_total_size or '?'}) [{seg_count} segs]")
                                 ack = bytes([packet_id]) + segment.to_bytes(2, "little") + bytes([1])
                                 if use_wifi:
                                     resp = bytes([len(device_id)]) + device_id.encode() + bytes([MSG_FILE_ACK]) + ack
                                 else:
                                     resp = bytes([peer_idx]) + bytes([MSG_FILE_ACK]) + ack
                                 gateway.send(channel, MSG_COMMAND, resp)
-                                print("  ACK sent")
+                                if complete:
+                                    completed.append((device_id, packet_id, bytes(stream.completed_data)))
+                                    print(f"[{dev_num}] *** COMPLETE: pid={packet_id}, size={len(stream.completed_data)} ***")
                         except Exception as e:
-                            print(f"  DATA error: {e}")
+                            print(f"[{dev_num}] DATA error: {e}")
 
                     elif msg_type_client == MSG_FILE_ACK:
                         if len(msg_data) >= 4:
                             ack_pid = msg_data[0]
                             ack_seg = int.from_bytes(msg_data[1:3], "little")
                             ack_res = msg_data[3]
-                            print(f"  ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
+                            print(f"[{dev_num}] ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
 
         time.sleep(0.1)
 
     print("Timeout reached")
+    if completed:
+        print(f"Completed {len(completed)} transfers:")
+        for device_id, packet_id, data in completed:
+            print(f"  [{device_id}] pid={packet_id}, size={len(data)}")
 
 
 def main():
