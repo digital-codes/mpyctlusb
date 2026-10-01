@@ -65,6 +65,27 @@ if not _CONF_FILE in files:
     raise BaseException("No Config")
 
 
+class _WiFiHandlerWrapper:
+    """Wraps a WiFiServer so the registered channel handler exposes both
+    the outbound message handler and get_client_list().
+
+    The usb_channel_server CTRL_GET_WIFI_CLIENTS handler checks
+    ``hasattr(handler, "get_client_list")`` on the registered handler.
+    Passing self._handle_outbound alone fails this check because bound
+    methods don't carry instance attributes. This wrapper is callable
+    (handler protocol) and also exposes get_client_list().
+    """
+
+    def __init__(self, server):
+        self._server = server
+
+    def __call__(self, msg_type, payload):
+        return self._server._handle_outbound(msg_type, payload)
+
+    def get_client_list(self):
+        return self._server.get_client_list()
+
+
 class WiFiServer:
     """WiFi Access Point server that accepts TCP connections and bridges messages.
 
@@ -168,7 +189,7 @@ class WiFiServer:
                 DIR_BIDI,
                 1024,  # Max packet size
                 name,
-                self._handle_outbound,
+                _WiFiHandlerWrapper(self),
             )
             print("WiFiServer: Channel registered")
         else:

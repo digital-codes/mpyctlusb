@@ -43,6 +43,22 @@ if not _CONF_FILE in files:
     raise BaseException("No Config")
 
 
+class _ESPNowHandlerWrapper:
+    """Wraps an ESPNowRadio so the registered channel handler exposes both
+    the outbound message handler and get_client_list() (for peer info).
+    """
+
+    def __init__(self, radio):
+        self._radio = radio
+
+    def __call__(self, msg_type, payload):
+        return self._radio._handle_outbound(msg_type, payload)
+
+    def get_client_list(self):
+        peer_macs = self._radio.get_peer_macs()
+        return [{"ip": mac.hex(), "device": "", "mac": mac.hex()} for mac in peer_macs]
+
+
 class ESPNowRadio:
     """ESP-NOW receiver bridging peer messages onto a USB gateway channel.
 
@@ -138,7 +154,7 @@ class ESPNowRadio:
                 DIR_BIDI,
                 self._radio_datalen,
                 name,
-                self._handle_outbound,
+                _ESPNowHandlerWrapper(self),
             )
 
 

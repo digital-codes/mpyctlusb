@@ -665,23 +665,9 @@ The following message types are defined in `common/channel_defs.py`:
 - `MSG_FILE_DATA = 0x31` - Data segment transfer
 - `MSG_FILE_ACK = 0x32` - Acknowledgment
 
-### Known Issue: CTRL_GET_WIFI_CLIENTS Returns Empty List
+### Known Issue: None (Fixed)
 
-**Affected versions:** `stick/usb_channel_server.py` (current code)
-
-**Symptom:** `radio_util.py -l` and `radio_util_test.py -l` always report "Connected clients (0)" even when clients are actively connected.
-
-**Root cause:** In `usb_channel_server.py` line 593-608, the `CTRL_GET_WIFI_CLIENTS` handler stores the WiFi channel's `_handle_outbound` method as the channel's `handler`. When checking for `get_client_list()`:
-```python
-handler = wifi_channel["handler"]  # = bound method _handle_outbound
-if hasattr(handler, "get_client_list"):  # False: bound methods don't have attributes
-    client_list = handler.get_client_list()
-```
-The check fails because `handler` is a bound method (`self._handle_outbound`), not the `WiFiServer` instance itself. `hasattr(bound_method, "get_client_list")` is always `False`, so the code always returns `bytes([0])` (empty list).
-
-**Workaround:** Use `-r` (receive mode) to discover clients as they send data. The host will see each client's `device_id` in the event payload and can address them directly with `-d <device_id>` for subsequent sends.
-
-**Fix:** Would require modifying `stick/wifi_server.py` to register the WiFiServer instance itself (not just its `_handle_outbound` method) so that `get_client_list()` can be accessed. Per project policy, stick code is not modified.
+The `CTRL_GET_WIFI_CLIENTS` bug where the host always received "Connected clients (0)" despite active clients has been fixed in `stick/wifi_server.py` and `stick/espnow_server.py` by introducing `_WiFiHandlerWrapper` and `_ESPNowHandlerWrapper` classes. These wrappers are callable (handler protocol) and also expose `get_client_list()`, allowing the USB channel server to access the WiFiServer's client list properly.
 
 ---
 
@@ -691,4 +677,3 @@ The check fails because `handler` is a bound method (`self._handle_outbound`), n
 - Add I²C sensor channels
 - Add SPI sensor channels
 - Add channel hot-plug notifications
-- Fix CTRL_GET_WIFI_CLIENTS bug in stick code
