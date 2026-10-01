@@ -559,31 +559,38 @@ The `radio_util.py` tool provides file transfer capabilities over ESP-NOW or WiF
 - Supports both ESP-NOW (`-e`) and WiFi (`-w`) modes
 - Checks if required radio channel is loaded, loads it if not
 - Prompts for confirmation when switching between WiFi and ESP-NOW (they are mutually exclusive)
-- Implements a robust transfer protocol with handshake and acknowledgment
+- Implements a robust transfer protocol with handshake, per-segment ACK, and echo verification
+- Hard fails (exit code 1) if the target device does not ACK handshake (3 sec timeout)
 
 ### Transfer Protocol
 
 The protocol uses a 16-bit header per packet:
 - Upper 4 bits: packet ID (0-15)
-- Lower 12 bits: segment number (0-4095)
+- Lower 12 bits: segment number (0-4095), sequential 0, 1, 2, ...
 
 **Handshake Phase:**
 1. Source sends `MSG_FILE_HANDSHAKE` with: `packet_id(1) + total_size(4)`
 2. Target responds with `MSG_FILE_ACK` to confirm buffer allocation
+3. If no ACK within 3 seconds: transfer aborts
 
 **Data Transfer Phase:**
-1. Source sends `MSG_FILE_DATA` with: `header(2) + data(~4KB)`
-2. Target echoes back the data packet
-3. Source verifies integrity
+1. Source sends `MSG_FILE_DATA` with: `header(2) + segment_data(~900 bytes)`
+2. Segment size is limited to 900 bytes (fits wifi_server's 1024 max_packet)
+3. Target responds with `MSG_FILE_ACK` per segment
+4. Target echoes back the data for verification
+5. Source waits for both ACK and echo per segment
 
 ### Host Tool: radio_util.py
 
 ```bash
-# Load WiFi channel and poll for incoming data
+# Send test data (5KB) to device 30 over WiFi
+python3 host/radio_util.py -w -t -d 30
+
+# Poll for incoming client data
 python3 host/radio_util.py -w -p
 
-# Load ESP-NOW channel and run test (sends test packet)
-python3 host/radio_util.py -e -t
+# List connected WiFi clients
+python3 host/radio_util.py -w -l
 ```
 
 Options:
@@ -591,20 +598,22 @@ Options:
 - `-w, --wifi` - Use WiFi server (USB channel 4)
 - `-t, --test` - Run host test mode (send test packet)
 - `-p, --poll` - Poll for incoming client data
+- `-l, --list` - List connected WiFi clients (see Known Issue)
+- `-d, --device ID` - Target device ID for WiFi (e.g. "30")
 
 ### Host Tool: radio_util_test.py
 
-A simpler test utility for the radio transfer protocol.
+A simpler test utility with similar functionality but explicit per-action flags.
 
 ```bash
-# Send test data (1KB) over WiFi
-python3 host/radio_util_test.py -w -s 1024
+# Send 3KB to device 30 over WiFi
+python3 host/radio_util_test.py -w -s 3000 -d 30
 
-# Receive mode (wait for incoming data)
-python3 host/radio_util_test.py -e -r
+# Receive mode (wait for incoming data, 60 sec timeout)
+python3 host/radio_util_test.py -w -r -t 60
 
-# Send test data over ESP-NOW
-python3 host/radio_util_test.py -e -s 512
+# Send 1KB to device over ESP-NOW
+python3 host/radio_util_test.py -e -s 1000
 ```
 
 Options:
@@ -612,34 +621,67 @@ Options:
 - `-w, --wifi` - Use WiFi server
 - `-s, --send SIZE` - Send test data of specified size
 - `-r, --receive` - Receive mode (wait for incoming data)
-- `-t, --timeout` - Receive timeout in seconds (default: 30)
+- `-l, --list` - List connected WiFi clients
+- `-d, --device ID` - Target device ID
+- `-t, --timeout SEC` - Receive timeout (default: 30)
 
 ### MicroPython Clients
 
-**client/radio_util_espnow.py** - ESP-NOW client for testing file transfer:
-```python
-import radio_util_espnow
-radio_util_espnow.run_test()      # Run test sequence
-radio_util_espnow.run_echo_mode() # Echo server mode
+Both clients connect to the server's WiFi AP (port 8080) or use ESP-NOW. They reuse the existing `private.py` and `config.json`.
+
+**client/radio_test_echo_wifi.py** - WiFi echo client:
+- Connects to server AP on port 8080
+- Sends identification frame (0x00 + device_id)
+- Waits for incoming handshake/data
+- Sends ACK + echoes data back
+```bash
+mpremote run client/radio_test_echo_wifi.py
 ```
 
-**client/radio_util_wifi.py** - WiFi client for testing file transfer:
+**client/radio_test_echo_espnow.py** - ESP-NOW echo client:
+- Receives handshake/data via ESP-NOW
+- Sends ACK + echoes data back
+```bash
+mpremote run client/radio_test_echo_espnow.py
+```
+
+**client/radio_util_wifi.py** - WiFi test client (imports and runs):
 ```python
 import radio_util_wifi
-radio_util_wifi.run_test()        # Run test sequence
-radio_util_wifi.run_echo_server() # Echo server mode (use "echo" argument)
+radio_util_wifi.run_test()  # Sends handshake + segments, waits for ACKs/echoes
 ```
 
-Both clients require:
-- `private.py` - WiFi credentials and keys
-- `config.json` - Device configuration
+**client/radio_util_espnow.py** - ESP-NOW test client:
+```python
+import radio_util_espnow
+radio_util_espnow.run_test()      # Test sequence
+radio_util_espnow.run_echo_mode() # Echo server
+```
 
 ### Protocol Constants
 
 The following message types are defined in `common/channel_defs.py`:
 - `MSG_FILE_HANDSHAKE = 0x30` - Transfer initialization
-- `MSG_FILE_DATA = 0x31` - Data packet transfer
+- `MSG_FILE_DATA = 0x31` - Data segment transfer
 - `MSG_FILE_ACK = 0x32` - Acknowledgment
+
+### Known Issue: CTRL_GET_WIFI_CLIENTS Returns Empty List
+
+**Affected versions:** `stick/usb_channel_server.py` (current code)
+
+**Symptom:** `radio_util.py -l` and `radio_util_test.py -l` always report "Connected clients (0)" even when clients are actively connected.
+
+**Root cause:** In `usb_channel_server.py` line 593-608, the `CTRL_GET_WIFI_CLIENTS` handler stores the WiFi channel's `_handle_outbound` method as the channel's `handler`. When checking for `get_client_list()`:
+```python
+handler = wifi_channel["handler"]  # = bound method _handle_outbound
+if hasattr(handler, "get_client_list"):  # False: bound methods don't have attributes
+    client_list = handler.get_client_list()
+```
+The check fails because `handler` is a bound method (`self._handle_outbound`), not the `WiFiServer` instance itself. `hasattr(bound_method, "get_client_list")` is always `False`, so the code always returns `bytes([0])` (empty list).
+
+**Workaround:** Use `-r` (receive mode) to discover clients as they send data. The host will see each client's `device_id` in the event payload and can address them directly with `-d <device_id>` for subsequent sends.
+
+**Fix:** Would require modifying `stick/wifi_server.py` to register the WiFiServer instance itself (not just its `_handle_outbound` method) so that `get_client_list()` can be accessed. Per project policy, stick code is not modified.
 
 ---
 
@@ -649,4 +691,4 @@ The following message types are defined in `common/channel_defs.py`:
 - Add I²C sensor channels
 - Add SPI sensor channels
 - Add channel hot-plug notifications
-- Implement application protocol on top of transport
+- Fix CTRL_GET_WIFI_CLIENTS bug in stick code

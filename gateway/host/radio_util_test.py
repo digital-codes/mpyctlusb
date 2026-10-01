@@ -670,7 +670,9 @@ def main():
             receive_loop(gateway, target_channel, args.wifi, args.timeout, device_mgr)
         elif args.send is not None:
             print(f"Using channel {target_channel} ({target_name})")
-            send_test(gateway, target_channel, args.wifi, args.send, args.device, device_mgr)
+            ok = send_test(gateway, target_channel, args.wifi, args.send, args.device, device_mgr)
+            if not ok:
+                return 1
         else:
             print("No action specified. Use -l to list, -r to receive, or -s SIZE to send.")
 

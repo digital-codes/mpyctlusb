@@ -485,20 +485,47 @@ def run_host_test(gateway, use_wifi=False, use_espnow=False, device_id="sensor1"
     try:
         ack_packet_id, ack_segment, result = transfer.wait_for_ack(timeout_ms=5000)
         print(f"Received ACK: packet_id={ack_packet_id}, segment={ack_segment}, result={result}")
-
-        print(f"Sending data packet: packet_id={packet_id}, segment=0, size={len(test_data)}")
-        transfer.send_data_packet(packet_id, 0, test_data)
-
-        recv_packet_id, recv_segment, recv_data = transfer.wait_for_data(timeout_ms=5000)
-        print(f"Received echo: packet_id={recv_packet_id}, segment={recv_segment}, size={len(recv_data)}")
-
-        if recv_data == test_data:
-            print("Data integrity verified!")
-        else:
-            print(f"Data mismatch! Expected {len(test_data)} bytes, got {len(recv_data)}")
-
     except ProtocolError as e:
-        print(f"Protocol error: {e}")
+        print(f"ERROR: {e}")
+        print(f"Device '{device_id}' did not ACK handshake - invalid or not connected")
+        return False
+
+    num_segments = (total_size + 900 - 1) // 900
+    print(f"Sending {num_segments} data segments")
+
+    echoed_data = bytearray()
+    for seg in range(num_segments):
+        start_byte = seg * 900
+        end_byte = min(start_byte + 900, total_size)
+        segment_data = test_data[start_byte:end_byte]
+
+        print(f"  Sending segment {seg}: size={len(segment_data)}")
+        transfer.send_data_packet(packet_id, seg, segment_data)
+
+        try:
+            ack_pid, ack_seg, ack_res = transfer.wait_for_ack(timeout_ms=3000)
+        except ProtocolError as e:
+            print(f"  ERROR: {e}")
+            return False
+
+        try:
+            recv_pid, recv_seg, recv_data = transfer.wait_for_data(timeout_ms=3000)
+        except ProtocolError as e:
+            print(f"  ERROR: No echo for segment {seg}: {e}")
+            return False
+
+        if recv_data != segment_data:
+            print(f"  Mismatch on seg {seg}: expected {len(segment_data)}, got {len(recv_data)}")
+            return False
+        echoed_data.extend(recv_data)
+        print(f"  Echo seg={recv_seg} OK")
+
+    if bytes(echoed_data) == test_data:
+        print("Data integrity verified!")
+        return True
+    else:
+        print(f"Data mismatch: expected {len(test_data)}, got {len(echoed_data)}")
+        return False
 
 
 class DeviceManager:
@@ -764,8 +791,10 @@ def main():
             print(f"Using channel {target_channel} ({target_name})")
             list_clients(gateway, args.wifi, device_mgr)
         elif args.test:
-            run_host_test(gateway, use_wifi=args.wifi, use_espnow=args.espnow,
+            ok = run_host_test(gateway, use_wifi=args.wifi, use_espnow=args.espnow,
                         device_id=args.device)
+            if not ok:
+                return 1
         elif args.poll:
             poll_for_clients(gateway, use_wifi=args.wifi, use_espnow=args.espnow)
         else:
