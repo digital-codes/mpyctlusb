@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -163,7 +164,8 @@ class PeerManager:
 
     def get_index(self, device_id):
         for idx, peer in enumerate(self.peers):
-            if peer.get("device") == device_id:
+            peer_dev = peer.get("device")
+            if peer_dev == device_id or str(peer_dev) == str(device_id):
                 return idx
         return None
 
