@@ -289,20 +289,41 @@ def parse_handshake(payload):
 
 
 class RadioTransfer:
-    def __init__(self, gateway, use_wifi=False, use_espnow=False):
+    def __init__(self, gateway, use_wifi=False, use_espnow=False, device_id="sensor1", peer_index=0):
         self.gateway = gateway
         self.use_wifi = use_wifi
         self.use_espnow = use_espnow
         self.wireless_channel = CHANNEL_WIFI if use_wifi else CHANNEL_ESPNOW
+        self.device_id = device_id
+        self.peer_index = peer_index
+
+    def _wrap_payload(self, protocol_msg_type, data):
+        if self.use_wifi:
+            device_bytes = self.device_id.encode("utf-8")
+            return bytes([len(device_bytes)]) + device_bytes + bytes([protocol_msg_type]) + data
+        else:
+            return bytes([self.peer_index]) + bytes([protocol_msg_type]) + data
+
+    def _unwrap_response(self, payload):
+        if self.use_wifi:
+            if len(payload) > 1:
+                device_len = payload[0]
+                if len(payload) > 1 + device_len:
+                    return payload[1 + device_len:]
+            return b""
+        else:
+            return payload[1:] if len(payload) > 1 else b""
 
     def send_handshake(self, packet_id, total_size):
         payload = encode_handshake(packet_id, total_size)
-        self.gateway.send(self.wireless_channel, MSG_FILE_HANDSHAKE, payload)
+        wrapped = self._wrap_payload(MSG_FILE_HANDSHAKE, payload)
+        self.gateway.send(self.wireless_channel, MSG_COMMAND, wrapped)
 
     def send_data_packet(self, packet_id, segment, data):
         header = get_header(packet_id, segment)
         payload = header + data
-        self.gateway.send(self.wireless_channel, MSG_FILE_DATA, payload)
+        wrapped = self._wrap_payload(MSG_FILE_DATA, payload)
+        self.gateway.send(self.wireless_channel, MSG_COMMAND, wrapped)
 
     def wait_for_ack(self, timeout_ms=5000):
         start = time.time()
@@ -311,11 +332,12 @@ class RadioTransfer:
             for kind, data in events:
                 if kind == "frame":
                     channel, msg_type, payload = data
-                    if channel == self.wireless_channel and msg_type == MSG_FILE_ACK:
-                        if len(payload) >= 5:
-                            ack_packet_id = payload[0]
-                            ack_segment = int.from_bytes(payload[1:3], "little")
-                            ack_result = payload[3]
+                    if channel == self.wireless_channel and msg_type == MSG_EVENT:
+                        resp = self._unwrap_response(payload)
+                        if len(resp) >= 4 and resp[0] == MSG_FILE_ACK:
+                            ack_packet_id = resp[1]
+                            ack_segment = int.from_bytes(resp[2:4], "little")
+                            ack_result = resp[4] if len(resp) > 4 else 0
                             return ack_packet_id, ack_segment, ack_result
             time.sleep(0.01)
         raise ProtocolError("timeout waiting for ACK")
@@ -327,8 +349,10 @@ class RadioTransfer:
             for kind, data in events:
                 if kind == "frame":
                     channel, msg_type, payload = data
-                    if channel == self.wireless_channel and msg_type == MSG_FILE_HANDSHAKE:
-                        return parse_handshake(payload)
+                    if channel == self.wireless_channel and msg_type == MSG_EVENT:
+                        resp = self._unwrap_response(payload)
+                        if len(resp) >= 5 and resp[0] == MSG_FILE_HANDSHAKE:
+                            return parse_handshake(resp[1:])
             time.sleep(0.01)
         raise ProtocolError("timeout waiting for handshake")
 
@@ -339,17 +363,20 @@ class RadioTransfer:
             for kind, data in events:
                 if kind == "frame":
                     channel, msg_type, payload = data
-                    if channel == self.wireless_channel and msg_type == MSG_FILE_DATA:
-                        if len(payload) >= HEADER_SIZE:
-                            packet_id, segment = parse_header(payload[:HEADER_SIZE])
-                            data = payload[HEADER_SIZE:]
-                            return packet_id, segment, data
+                    if channel == self.wireless_channel and msg_type == MSG_EVENT:
+                        resp = self._unwrap_response(payload)
+                        if len(resp) >= 3 and resp[0] == MSG_FILE_DATA:
+                            if len(resp) >= 1 + HEADER_SIZE:
+                                packet_id, segment = parse_header(resp[1:1+HEADER_SIZE])
+                                data = resp[1+HEADER_SIZE:]
+                                return packet_id, segment, data
             time.sleep(0.01)
         raise ProtocolError("timeout waiting for data")
 
     def send_ack(self, packet_id, segment, result=1):
         payload = bytes([packet_id]) + segment.to_bytes(2, "little") + bytes([result])
-        self.gateway.send(self.wireless_channel, MSG_FILE_ACK, payload)
+        wrapped = self._wrap_payload(MSG_FILE_ACK, payload)
+        self.gateway.send(self.wireless_channel, MSG_COMMAND, wrapped)
 
 
 def get_channel_list(gateway):
@@ -411,14 +438,17 @@ def check_and_load_channel(gateway, target_channel, target_name):
     channels = parse_channels(payload)
     loaded_channels = {ch_id: name for ch_id, name in channels}
 
+    print(f"Current channels: {', '.join(f'{k}:{v}' for k,v in loaded_channels.items())}")
+
     if target_channel in loaded_channels:
+        print(f"Channel {target_channel} ({target_name}) already loaded")
         return True, "Channel already loaded"
 
     other_wireless = CHANNEL_WIFI if target_channel == CHANNEL_ESPNOW else CHANNEL_ESPNOW
     if other_wireless in loaded_channels:
         other_name = "WiFi" if other_wireless == CHANNEL_WIFI else "ESP-NOW"
         target_name_str = "WiFi" if target_channel == CHANNEL_WIFI else "ESP-NOW"
-        print(f"WARNING: {other_name} is currently loaded.")
+        print(f"WARNING: {other_name} is currently loaded (channel {other_wireless}).")
         print(f"To use {target_name_str}, the radio needs to be reconfigured.")
         response = input(f"Continue and reload for {target_name_str}? (y/N): ")
         if response.lower() != 'y':
@@ -474,26 +504,34 @@ def poll_for_clients(gateway, use_wifi=False, use_espnow=False):
             for kind, data in events:
                 if kind == "frame":
                     channel, msg_type, payload = data
-                    if channel == transfer.wireless_channel:
-                        if msg_type == MSG_FILE_HANDSHAKE:
-                            packet_id, total_size = parse_handshake(payload)
-                            print(f"Received handshake: packet_id={packet_id}, total_size={total_size}")
-                            transfer.send_ack(packet_id, 0, 1)
-                            print("Sent ACK")
+                    if channel == transfer.wireless_channel and msg_type == MSG_EVENT:
+                        resp = transfer._unwrap_response(payload)
+                        if len(resp) >= 1:
+                            msg_type_client = resp[0]
+                            msg_data = resp[1:]
 
-                        elif msg_type == MSG_FILE_DATA:
-                            if len(payload) >= HEADER_SIZE:
-                                packet_id, segment = parse_header(payload[:HEADER_SIZE])
-                                data = payload[HEADER_SIZE:]
-                                print(f"Received data: packet_id={packet_id}, segment={segment}, size={len(data)}")
-                                transfer.send_ack(packet_id, segment, 1)
+                            if msg_type_client == MSG_FILE_HANDSHAKE:
+                                try:
+                                    packet_id, total_size = parse_handshake(msg_data)
+                                    print(f"Received handshake: packet_id={packet_id}, total_size={total_size}")
+                                    transfer.send_ack(packet_id, 0, 1)
+                                    print("Sent ACK")
+                                except Exception as e:
+                                    print(f"Handshake parse error: {e}")
 
-                        elif msg_type == MSG_FILE_ACK:
-                            if len(payload) >= 5:
-                                ack_packet_id = payload[0]
-                                ack_segment = int.from_bytes(payload[1:3], "little")
-                                ack_result = payload[3]
-                                print(f"Received ACK: packet_id={ack_packet_id}, segment={ack_segment}, result={ack_result}")
+                            elif msg_type_client == MSG_FILE_DATA:
+                                if len(msg_data) >= HEADER_SIZE:
+                                    packet_id, segment = parse_header(msg_data[:HEADER_SIZE])
+                                    data = msg_data[HEADER_SIZE:]
+                                    print(f"Received data: packet_id={packet_id}, segment={segment}, size={len(data)}")
+                                    transfer.send_ack(packet_id, segment, 1)
+
+                            elif msg_type_client == MSG_FILE_ACK:
+                                if len(msg_data) >= 4:
+                                    ack_packet_id = msg_data[0]
+                                    ack_segment = int.from_bytes(msg_data[1:3], "little")
+                                    ack_result = msg_data[3]
+                                    print(f"Received ACK: packet_id={ack_packet_id}, segment={ack_segment}, result={ack_result}")
 
                 elif kind == "error":
                     print(f"Error: {data}")
