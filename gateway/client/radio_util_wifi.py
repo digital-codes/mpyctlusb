@@ -108,9 +108,10 @@ def run_test():
     send_identification(sock, DEVICE_ID)
     print("Connected and identified")
 
+    FRAGMENT_SIZE = 1000
     print("\n--- Test 1: Send handshake ---")
     packet_id = 1
-    total_size = 1024
+    total_size = 3011
     payload = bytes([MSG_FILE_HANDSHAKE]) + encode_handshake(packet_id, total_size)
     print(f"Sending handshake: packet_id={packet_id}, total_size={total_size}")
     sock.send(payload)
@@ -118,145 +119,46 @@ def run_test():
 
     time.sleep(0.5)
 
-    print("\n--- Test 2: Send data packet ---")
-    test_data = b"C" * 512
-    payload = bytes([MSG_FILE_DATA]) + get_header(packet_id, 0) + test_data
-    print(f"Sending data: packet_id={packet_id}, segment=0, size={len(test_data)}")
-    sock.send(payload)
-    print("Sent")
+    bytes_to_send = total_size
+    seg = 0
+    while bytes_to_send > 0:
+        test_data = b"C" * min(bytes_to_send, FRAGMENT_SIZE)
+        payload = bytes([MSG_FILE_DATA]) + get_header(packet_id, seg) + test_data
+        print(f"\n--- Sending segment {seg}: size={len(test_data)} ---")
+        sock.send(payload)
 
-    print("\n--- Receiving responses ---")
-    for _ in range(10):
-        try:
-            sock.setblocking(False)
-            data = sock.recv(4096)
-            if data:
-                print(f"Received: {len(data)} bytes")
-                if len(data) >= 1:
-                    msg_type = data[0]
-                    payload = data[1:]
-                    if msg_type == MSG_FILE_ACK:
-                        if len(payload) >= 3:
-                            ack_pid = payload[0]
-                            ack_seg = int.from_bytes(payload[1:3], "little")
-                            ack_res = payload[3] if len(payload) > 3 else 0
-                            print(f"  ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
-        except OSError:
-            pass
-        except Exception as e:
-            print(f"Error: {e}")
-        time.sleep(0.2)
+        bytes_to_send -= len(test_data)
+        seg += 1
+
+        for _ in range(10):
+            try:
+                sock.setblocking(False)
+                data = sock.recv(4096)
+                if data:
+                    print(f"Received: {len(data)} bytes")
+                    if len(data) >= 1:
+                        msg_type = data[0]
+                        payload = data[1:]
+                        if msg_type == MSG_FILE_ACK:
+                            if len(payload) >= 4:
+                                ack_pid = payload[0]
+                                ack_seg = int.from_bytes(payload[1:3], "little")
+                                ack_res = payload[3]
+                                print(f"  ACK: pid={ack_pid}, seg={ack_seg}, result={ack_res}")
+                                break
+            except OSError:
+                pass
+            except Exception as e:
+                print(f"Error: {e}")
+            time.sleep(0.2)
 
     print("\nDone")
     sock.close()
 
 
 def run_echo_server():
-    print("Starting WiFi echo server mode")
-
-    try:
-        with open("config.json", "r") as f:
-            config = json.load(f)
-    except Exception:
-        config = {}
-
-    DEVICE_ID = str(config.get("device", "unknown"))
-
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(False)
-    time.sleep(1)
-    wlan.active(True)
-
-    while not wlan.active():
-        print("Activating WiFi...")
-        time.sleep(1)
-
-    try:
-        wlan.config(channel=WIFI_CHANNEL)
-    except Exception:
-        pass
-
-    try:
-        wlan.config(pm=wlan.PM_NONE)
-    except Exception:
-        pass
-
-    print("Connecting to WiFi...")
-    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-    while not wlan.isconnected():
-        print("Connecting...")
-        time.sleep(1)
-
-    print("Connected! IP:", wlan.ifconfig()[0])
-    SERVER_IP = wlan.ifconfig()[2]
-    print("Server:", SERVER_IP)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", 8081))
-    sock.listen(1)
-    sock.settimeout(0)
-    print("Listening on port 8081 for echo server...")
-
-    clients = []
-
-    try:
-        while True:
-            try:
-                cl, addr = sock.accept()
-                cl.settimeout(0)
-                clients.append(cl)
-                print(f"Client connected: {addr}")
-            except OSError:
-                pass
-
-            for cl in clients[:]:
-                try:
-                    cl.setblocking(False)
-                    data = cl.recv(4096)
-                    if data:
-                        msg_type = data[0] if len(data) > 0 else 0
-                        payload = data[1:] if len(data) > 1 else b""
-
-                        if msg_type == MSG_FILE_HANDSHAKE:
-                            try:
-                                packet_id, total_size = parse_handshake(payload)
-                                print(f"HS: pid={packet_id} size={total_size}")
-                                ack = bytes([MSG_FILE_ACK]) + bytes([packet_id]) + (0).to_bytes(2, "little") + bytes([1])
-                                cl.send(ack)
-                            except Exception as e:
-                                print(f"HS err: {e}")
-
-                        elif msg_type == MSG_FILE_DATA:
-                            try:
-                                if len(payload) >= HEADER_SIZE:
-                                    packet_id, segment = parse_header(payload[:HEADER_SIZE])
-                                    recv_data = payload[HEADER_SIZE:]
-                                    print(f"DATA: pid={packet_id} seg={segment} size={len(recv_data)}")
-                                    ack = bytes([MSG_FILE_ACK]) + bytes([packet_id]) + segment.to_bytes(2, "little") + bytes([1])
-                                    cl.send(ack)
-                            except Exception as e:
-                                print(f"DATA err: {e}")
-
-                    else:
-                        cl.close()
-                        clients.remove(cl)
-                except OSError:
-                    pass
-                except Exception as e:
-                    try:
-                        cl.close()
-                        clients.remove(cl)
-                    except Exception:
-                        pass
-
-            time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        print("\nExiting")
-        for cl in clients:
-            cl.close()
-        sock.close()
+    print("Deprecated: use radio_test_echo_wifi.py instead")
+    print("WiFi echo client connects to server AP and echoes incoming data")
 
 
 if __name__ == "__main__":
