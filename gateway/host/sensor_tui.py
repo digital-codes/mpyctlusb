@@ -412,21 +412,27 @@ class TUI:
         """Send all peers to the ESP-NOW server via peer_add messages."""
         if self.gateway is None:
             return
+
+        time.sleep(0.1)
+
         for peer in self.peers:
             try:
                 mac_hex = peer.get("mac", "")
-                lmk_hex = peer.get("lmk", "")
+                if not mac_hex:
+                    continue
+
                 mac = bytes.fromhex(mac_hex)
+                lmk_hex = peer.get("lmk", "")
                 lmk = bytes.fromhex(lmk_hex) if lmk_hex else None
 
-                payload = mac
-                if lmk:
-                    payload += lmk
+                payload = mac + (lmk if lmk else b"")
 
                 self.gateway.send(CHANNEL_ESPNOW, MSG_PEER_ADD, payload)
-                print(f"Sent peer_add for {mac_hex}")
+                print(f"Sent peer_add for {mac_hex} idx={self.peers.index(peer)}", end="")
+                time.sleep(0.05)
             except Exception as e:
                 print(f"Failed to send peer_add for {peer.get('mac')}: {e}")
+        print()
 
     def _save_and_clear_log(self):
         """Save ESP-NOW messages and status to sensor_test.log and clear them."""
@@ -666,8 +672,10 @@ class TUI:
         rows, columns = screen.getmaxyx()
 
         def line(row, text):
-            if row < rows:
-                screen.addnstr(row, 0, text, max(0, columns - 1))
+            if 0 <= row < rows:
+                if len(text) >= columns:
+                    text = text[:columns - 4] + "..."
+                screen.addnstr(row, 0, text, len(text))
 
         line(0, "AtomS3U Sensor Gateway")
         line(1, "Status: %s | Button: %s | RGB: %r%s" % (self.status, self.button, self.rgb, " | " + self.last_action if self.last_action else ""))
@@ -709,9 +717,12 @@ class TUI:
         else:
             line(row, "Keys: r/g/b/w/y/0=RGB, p/c/d/s/x/m/q")
 
-        footer = max(row + 2, rows - 2)
+        footer = rows - 2
         if self.last_error:
-            line(footer + 1, "Error: " + self.last_error)
+            error_line = "Error: " + self.last_error
+            if len(error_line) > columns - 1:
+                error_line = error_line[:columns - 4] + "..."
+            line(footer, error_line)
 
         screen.refresh()
 
