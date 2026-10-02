@@ -160,14 +160,13 @@ WiFi uses the same `config.json` as ESP-NOW, with an additional `device` field o
 
 ```json
 {
-  "device": "sensor1",
   "id":  "<device id>",
   "ble":  {"key": "<32 hex chars = 16-byte shared key>"},
   "wlan": {"addr": "<own MAC hex>"}
 }
 ```
 
-`device` is a free-form string used as a stable client identifier. The
+`device id` is a 16 bit unsigned int as a stable client identifier. The
 stick wifi_server maps it to the client's current IP address whenever a
 TCP connection is established.
 
@@ -217,11 +216,11 @@ sends it as the identification frame on connect.
 WiFi clients are identified by their `device` id (not IP, which can
 change when DHCP reassigns addresses). On every new connection:
 
-- Client sends an identification frame: `0x00` (marker) + `device_id` (UTF-8)
+- Client sends an identification frame: 16 bit uint `device_id` (device_id_int.to_bytes(2, "little"))
 - Server records `device_id <-> IP` in `self.device_by_ip` and
   `self.ip_by_device` mappings and removes them when the client closes
 - The stick then forwards messages on this connection as USB events whose
-  payload is `device_id_len(1) + device_id_bytes + message`
+  payload is `device_id (2 bytes) + message`
 - The host `CTRL_GET_WIFI_CLIENTS` response lists each connected client
   with its current IP and device id; the TUI uses the device id for
   display and selection
