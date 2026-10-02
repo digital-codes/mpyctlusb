@@ -294,7 +294,7 @@ class ESPNowRadio:
     def _handle_outbound(self, msg_type, payload):
         """Handle outbound messages from the host.
 
-        MSG_COMMAND payload: peer_index:u8 + binary_data
+        MSG_COMMAND payload: mac:6-bytes + binary_data
         MSG_PEER_ADD payload: mac:6-bytes + lmk:16-bytes (optional)
         MSG_PEER_DEL payload: mac:6-bytes
         
@@ -304,13 +304,13 @@ class ESPNowRadio:
             negative on specific errors
         """
         if msg_type == MSG_COMMAND:
-            if len(payload) < 1:
+            if len(payload) < 6:
                 if self.debug:
-                    print("Outbound: no peer index specified")
-                return -1  # No peer index
+                    print("Outbound: no MAC specified")
+                return -1  # No MAC
 
-            peer_index = payload[0]
-            data = payload[1:]
+            mac = bytes(payload[:6])
+            data = payload[6:]
 
             peer_macs = self.get_peer_macs()
             if not peer_macs:
@@ -318,16 +318,14 @@ class ESPNowRadio:
                     print("Outbound: no peers registered")
                 return -2  # No peers
 
-            if peer_index >= len(peer_macs):
+            if mac not in peer_macs:
                 if self.debug:
-                    print(f"Outbound: invalid peer index {peer_index} (max {len(peer_macs)-1})")
-                return -3  # Invalid peer index
-
-            mac = peer_macs[peer_index]
+                    print(f"Outbound: unknown peer MAC {mac.hex()}")
+                return -3  # Unknown peer MAC
             full_payload = self.shared_key[:16] + data
 
             if self.debug:
-                print(f"Outbound to peer {peer_index} ({mac.hex()}): {len(data)} bytes")
+                print(f"Outbound to peer {mac.hex()}: {len(data)} bytes")
 
             result = self.send_to_peer(mac, full_payload)
             return result  # 1 for success, 0 for failure

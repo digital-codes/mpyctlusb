@@ -536,16 +536,16 @@ class TUI:
             payload = bytes([len(device_bytes)]) + device_bytes + message.encode()
         else:
             # ESP-NOW: look up device_id in peers to get peer_index
-            peer_index = None
-            for idx, peer in enumerate(self.peers):
+            peer_mac = None
+            for _, peer in enumerate(self.peers):
                 peer_dev = peer.get("device", "")
                 if peer_dev == device_id or str(peer_dev) == str(device_id):
-                    peer_index = idx
+                    peer_mac = peer.get("mac",None)
                     break
-            if peer_index is None:
+            if peer_mac is None:
                 self.last_error = f"Device '{device_id}' not in peers.json"
                 return False
-            payload = bytes([peer_index]) + message.encode()
+            payload = bytes.fromhex(peer_mac) + message.encode()
 
         try:
             self.gateway.send(self.wireless_channel, MSG_COMMAND, payload)
