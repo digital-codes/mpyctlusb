@@ -511,7 +511,7 @@ class TUI:
     def send_espnow_message(self, peer_index, message):
         """Send a message to a specific peer via wireless channel (ESP-NOW or WiFi).
 
-        For ESP-NOW: payload = peer_index:u8 + message:string
+        For ESP-NOW: payload = peer_index:u8 + message:bytes (binary)
         For WiFi: payload = device_id_len:u8 + device_id_bytes + message:bytes
         """
         if self.wireless_channel is None:
@@ -539,7 +539,7 @@ class TUI:
             print(f"DEBUG: Sending to channel {self.wireless_channel}, payload={payload.hex()}")
             self.gateway.send(self.wireless_channel, MSG_COMMAND, payload)
             mode = "WiFi" if self.use_wifi else "ESP-NOW"
-            target = client_list[peer_index] if self.use_wifi else f"peer {peer_index}"
+            target = client_list[peer_index] if self.use_wifi else (client_list[peer_index].get("device", f"peer {peer_index}") if isinstance(client_list[peer_index], dict) else f"peer {peer_index}")
             self.last_action = f"sent via {mode} to {target}: {message[:20]}"
             return True
         except Exception as e:
@@ -698,7 +698,8 @@ class TUI:
                 if self.use_wifi:
                     peer_label = client_list[self.input_peer]  # device ID string
                 else:
-                    peer_label = client_list[self.input_peer].get("mac", "unknown")
+                    peer = client_list[self.input_peer]
+                    peer_label = peer.get("device", peer.get("mac", "unknown"))
                 line(row, "To peer %d (%s): %s" % (self.input_peer, peer_label, self.input_text))
             else:
                 count = len(client_list) if client_list else 0

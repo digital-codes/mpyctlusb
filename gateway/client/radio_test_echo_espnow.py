@@ -122,6 +122,13 @@ def main():
                     except Exception as e:
                         print(f"DATA error: {e}")
 
+                else:
+                    try:
+                        text_msg = payload.decode("utf-8")
+                        print(f"MSG: {text_msg}")
+                    except:
+                        print(f"RAW: {payload.hex()}")
+
     except KeyboardInterrupt:
         print("Exiting")
     except Exception as e:
