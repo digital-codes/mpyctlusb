@@ -93,7 +93,7 @@ def main():
                 time.sleep(0.1)
                 continue
 
-            if len(msg) >= 16 and msg[:16] == SHARED_KEY:
+            if len(msg) >= 16 and msg[:16] == SHARED_KEY[:16]:
                 app_data = msg[16:]
                 if len(app_data) < 1:
                     continue

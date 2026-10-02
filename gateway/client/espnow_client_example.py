@@ -101,7 +101,7 @@ def _drain(ignored):
             return
         
         # Check if message has the shared key header
-        if len(message) >= 16 and message[:16] == SHARED_KEY:
+        if len(message) >= 16 and message[:16] == SHARED_KEY[:16]:
             application_data = message[16:]
             print("\n*** Received from", mac.hex(), "***")
             print("    Data:", application_data.decode())
