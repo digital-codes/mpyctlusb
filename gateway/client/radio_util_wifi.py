@@ -36,8 +36,6 @@ MSG_FILE_ACK = 0x32
 MAX_PACKET_SIZE = 4096
 HEADER_SIZE = 2
 
-ID_MARKER = b"\x00"
-
 
 def get_header(packet_id, segment):
     return bytes([((packet_id << 4) & 0xF0) | ((segment >> 8) & 0x0F), segment & 0x0F])
@@ -81,9 +79,10 @@ def connect_to_server():
 
 
 def send_identification(sock, device_id):
-    sock.send(ID_MARKER + device_id.encode("utf-8"))
+    device_id_int = int(device_id)
+    sock.send(device_id_int.to_bytes(2, "little"))
 
-
+    
 def run_test():
     print("Starting WiFi file transfer test client")
     print("SSID:", WIFI_SSID)

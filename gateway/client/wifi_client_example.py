@@ -32,10 +32,8 @@ WIFI_CHANNEL = pr.WIFI_CHANNEL
 SERVER_PORT = 8080
 SHARED_KEY = bytes.fromhex(pr.WIFI_KEY[:32])
 
-# Marker byte that prefixes the very first frame on a connection. The
-# server expects this marker followed by the UTF-8 device id; subsequent
-# frames are raw application data.
-ID_MARKER = b"\x00"
+# server expects 2 byte (little endian) device id as the very first packet;
+# subsequent frames are raw application data.
 
 print("WiFi Client starting...")
 print("SSID:", WIFI_SSID)
@@ -110,7 +108,8 @@ def send_identification():
     if sock is None:
         return False
     try:
-        sock.send(ID_MARKER + DEVICE_ID.encode("utf-8"))
+        device_id_int = int(DEVICE_ID)
+        sock.send(device_id_int.to_bytes(2, "little"))
         identified = True
         print("Sent identification: device", DEVICE_ID)
         return True

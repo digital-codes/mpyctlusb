@@ -24,7 +24,6 @@ WIFI_SSID = pr.WIFI_SSID
 WIFI_PASSWORD = pr.WIFI_PASSWORD
 WIFI_CHANNEL = pr.WIFI_CHANNEL
 SERVER_PORT = 8080
-ID_MARKER = b"\x00"
 
 MSG_FILE_HANDSHAKE = 0x30
 MSG_FILE_DATA = 0x31
@@ -89,7 +88,8 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((SERVER_IP, SERVER_PORT))
     sock.settimeout(0)
-    sock.send(ID_MARKER + DEVICE_ID.encode("utf-8"))
+    device_id_int = int(DEVICE_ID)
+    sock.send(device_id_int.to_bytes(2, "little"))
     print(f"Identified as '{DEVICE_ID}'. Echo mode running. Press Ctrl+C to exit.")
 
     rx_buffer = b""

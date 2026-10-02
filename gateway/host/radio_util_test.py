@@ -122,11 +122,11 @@ PEERS_PATH = os.path.join(os.path.dirname(__file__), "..", "stick", "peers.json"
 
 
 class PeerManager:
-    """Loads peers.json, registers them with ESP-NOW server, maps device_id -> peer_index."""
+    """Loads peers.json, registers them with ESP-NOW server, maps device_id -> peer MAC."""
 
     def __init__(self):
         self.peers = []
-        self.device_to_index = {}
+        self.device_to_mac = {}
 
     def load(self):
         try:
@@ -158,15 +158,21 @@ class PeerManager:
                 if lmk:
                     payload += lmk
                 gateway.send(CHANNEL_ESPNOW, MSG_PEER_ADD, payload)
-                print(f"Sent peer_add for {mac_hex}")
+                print(f"Sent peer_add for {mac_hex}, device_id={peer.get('device')}")
             except Exception as e:
-                print(f"Failed to send peer_add for {peer.get('mac')}: {e}")
+                print(f"Failed to send peer_add for {peer.get('mac')}: {e}, device_id={peer.get('device')}")
 
-    def get_index(self, device_id):
-        for idx, peer in enumerate(self.peers):
+    def get_mac(self, device_id):
+        for peer in self.peers:
             peer_dev = peer.get("device")
             if peer_dev == device_id or str(peer_dev) == str(device_id):
-                return idx
+                mac_hex = peer.get("mac", "")
+                if not mac_hex:
+                    return None
+                try:
+                    return bytes.fromhex(mac_hex)
+                except ValueError:
+                    return None
         return None
 
 
@@ -240,6 +246,7 @@ class USBGateway:
             ))
             + payload
         )
+        print(f"Sending frame: channel={channel}, msg_type={msg_type}, length={len(payload)}")
 
         try:
             with self.write_lock:
@@ -378,7 +385,7 @@ def check_and_load_channel(gateway, target_channel, target_name):
         return False, "Failed to load channel"
 
 
-def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", device_mgr=None, peer_mgr=None):
+def send_test(gateway, channel, use_wifi, data_size=5000, device_id=-1, device_mgr=None, peer_mgr=None):
     packet_id = 1
     total_size = data_size
     test_data = b"T" * data_size
@@ -386,20 +393,30 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", d
     MAX_SEGMENT_SIZE = 900
     num_segments = (total_size + MAX_SEGMENT_SIZE - 1) // MAX_SEGMENT_SIZE
 
-    peer_index = 0
+    peer_mac = b""
     if use_wifi:
-        device_bytes = device_id.encode("utf-8")
-        wrapper = bytes([len(device_bytes)]) + device_bytes
-        print(f"Test params: data_size={data_size}, segments={num_segments}, device={device_id}")
+        try:
+            wifi_device_id = int(device_id)
+        except (TypeError, ValueError):
+            print(f"Error: invalid WiFi device id '{device_id}', expected integer")
+            return False
+        if not 0 <= wifi_device_id <= 0xFFFF:
+            print(f"Error: WiFi device id out of range (0..65535): {wifi_device_id}")
+            return False
+
+        wrapper = wifi_device_id.to_bytes(2, "little")
+        print(f"Test params: data_size={data_size}, segments={num_segments}, device={wifi_device_id}")
     else:
-        if peer_mgr is not None:
-            idx = peer_mgr.get_index(device_id)
-            if idx is None:
-                print(f"Error: device '{device_id}' not in peers.json")
-                return False
-            peer_index = idx
-        wrapper = bytes([peer_index])
-        print(f"Test params: data_size={data_size}, segments={num_segments}, device={device_id}, peer_index={peer_index}")
+        if peer_mgr is None:
+            print("Error: peer manager required for ESP-NOW mode")
+            return False
+        mac = peer_mgr.get_mac(device_id)
+        if mac is None:
+            print(f"Error: device '{device_id}' not in peers.json")
+            return False
+        peer_mac = mac
+        wrapper = peer_mac
+        print(f"Test params: data_size={data_size}, segments={num_segments}, device={device_id}, peer_mac={peer_mac.hex()}")
 
     handshake_payload = encode_handshake(packet_id, total_size)
     full_payload = wrapper + bytes([MSG_FILE_HANDSHAKE]) + handshake_payload
@@ -413,20 +430,19 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", d
             for ch, msg_type, payload in frames:
                 if ch == channel and msg_type == MSG_EVENT:
                     if use_wifi:
-                        if len(payload) > 1:
-                            device_len = payload[0]
-                            if len(payload) > 1 + device_len:
-                                src_device = payload[1:1 + device_len].decode("utf-8", "replace")
-                                resp_payload = payload[1 + device_len:]
-                            else:
-                                continue
-                        else:
+                        if len(payload) < 2:
                             continue
+                        src_device = int.from_bytes(payload[:2], "little")
+                        resp_payload = payload[2:]
                     else:
-                        src_device = None
-                        resp_payload = payload[1:] if len(payload) > 1 else b""
+                        if len(payload) < 7:
+                            continue
+                        src_mac = payload[:6]
+                        resp_payload = payload[7:]
 
-                    if use_wifi and src_device != device_id:
+                    if use_wifi and src_device != wifi_device_id:
+                        continue
+                    if not use_wifi and peer_mac and src_mac != peer_mac:
                         continue
 
                     if len(resp_payload) >= 5 and resp_payload[0] == MSG_FILE_ACK:
@@ -444,20 +460,19 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id="sensor1", d
             for ch, msg_type, payload in frames:
                 if ch == channel and msg_type == MSG_EVENT:
                     if use_wifi:
-                        if len(payload) > 1:
-                            device_len = payload[0]
-                            if len(payload) > 1 + device_len:
-                                src_device = payload[1:1 + device_len].decode("utf-8", "replace")
-                                resp_payload = payload[1 + device_len:]
-                            else:
-                                continue
-                        else:
+                        if len(payload) < 2:
                             continue
+                        src_device = int.from_bytes(payload[:2], "little")
+                        resp_payload = payload[2:]
                     else:
-                        src_device = None
-                        resp_payload = payload[1:] if len(payload) > 1 else b""
+                        if len(payload) < 7:
+                            continue
+                        src_mac = payload[:6]
+                        resp_payload = payload[7:]
 
-                    if use_wifi and src_device != device_id:
+                    if use_wifi and src_device != wifi_device_id:
+                        continue
+                    if not use_wifi and peer_mac and src_mac != peer_mac:
                         continue
 
                     if len(resp_payload) >= 3 and resp_payload[0] == MSG_FILE_DATA:
@@ -551,12 +566,10 @@ def _parse_wifi_clients(payload, device_mgr):
             pos += 1
             ip = payload[pos:pos + ip_len].decode()
             pos += ip_len
-            if pos >= len(payload):
+            if pos + 2 > len(payload):
                 break
-            device_len = payload[pos]
-            pos += 1
-            device = payload[pos:pos + device_len].decode()
-            pos += device_len
+            device = int.from_bytes(payload[pos:pos + 2], "little")
+            pos += 2
             if pos >= len(payload):
                 break
             mac_len = payload[pos]
@@ -583,18 +596,18 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
         for ch, msg_type, payload in frames:
             if ch == channel and msg_type == MSG_EVENT:
                 if use_wifi:
-                    if len(payload) > 1:
-                        device_len = payload[0]
-                        device_id = payload[1:1+device_len].decode("utf-8", "replace") if device_len > 0 else "unknown"
-                        resp_payload = payload[1 + device_len:]
-                        device_mgr.add_device(device_id)
-                    else:
+                    if len(payload) < 2:
                         continue
-                    peer_idx = None
+                    device_id = int.from_bytes(payload[:2], "little")
+                    resp_payload = payload[2:]
+                    device_mgr.add_device(device_id)
                 else:
-                    peer_idx = payload[0] if len(payload) > 0 else 0
-                    device_id = f"peer_{peer_idx}"
-                    resp_payload = payload[1:] if len(payload) > 1 else b""
+                    if len(payload) < 7:
+                        continue
+                    peer_mac = payload[:6]
+                    mac_hex = peer_mac.hex()
+                    device_id = mac_hex
+                    resp_payload = payload[7:]
 
                 if device_id not in streams:
                     streams[device_id] = DeviceStream(device_id)
@@ -611,9 +624,9 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                             print(f"[{device_id}] HS: pid={packet_id}, size={total_size}")
                             ack = bytes([packet_id]) + (0).to_bytes(2, "little") + bytes([1])
                             if use_wifi:
-                                resp = bytes([len(device_id)]) + device_id.encode() + bytes([MSG_FILE_ACK]) + ack
+                                resp = int(device_id).to_bytes(2, "little") + bytes([MSG_FILE_ACK]) + ack
                             else:
-                                resp = bytes([peer_idx]) + bytes([MSG_FILE_ACK]) + ack
+                                resp = peer_mac + bytes([MSG_FILE_ACK]) + ack
                             gateway.send(channel, MSG_COMMAND, resp)
                         except Exception as e:
                             print(f"[{device_id}] HS error: {e}")
@@ -628,9 +641,9 @@ def receive_loop(gateway, channel, use_wifi, timeout=30, device_mgr=None):
                                 print(f"[{device_id}] DATA: pid={packet_id}, seg={segment}, size={len(data)} ({stream.received_size}/{stream.current_total_size or '?'}) [{seg_count} segs]")
                                 ack = bytes([packet_id]) + segment.to_bytes(2, "little") + bytes([1])
                                 if use_wifi:
-                                    resp = bytes([len(device_id)]) + device_id.encode() + bytes([MSG_FILE_ACK]) + ack
+                                    resp = int(device_id).to_bytes(2, "little") + bytes([MSG_FILE_ACK]) + ack
                                 else:
-                                    resp = bytes([peer_idx]) + bytes([MSG_FILE_ACK]) + ack
+                                    resp = peer_mac + bytes([MSG_FILE_ACK]) + ack
                                 gateway.send(channel, MSG_COMMAND, resp)
                                 if complete:
                                     completed.append((device_id, packet_id, bytes(stream.completed_data)))
@@ -695,9 +708,9 @@ def main():
     )
     parser.add_argument(
         "-d", "--device",
-        type=str,
-        default="sensor1",
-        help="Device ID for WiFi (default: sensor1)"
+        type=int,
+        default=30,
+        help="Device ID (integer)"
     )
     args = parser.parse_args()
 

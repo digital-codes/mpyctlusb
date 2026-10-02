@@ -7,8 +7,7 @@
 #
 # Configuration lives in /config.json on the device:
 #   {
-#     "device": "<device id string>",
-#     "id":  "<device id>",
+#     "id":  <device id>,
 #     "ble":  {"key": "<32 hex chars = 16-byte shared key>"},
 #     "wlan": {"addr": "<own MAC hex>"},
 #     ...
@@ -22,7 +21,7 @@
 #
 # Client identification protocol:
 #   - Each client must send an identification packet as the first frame on
-#     a new connection. Format: 0x00 marker + device_id (UTF-8 bytes).
+#     a new connection. Format: device_id:u16 (little-endian).
 #   - The server builds an ip -> device_id mapping (also device_id -> ip)
 #     and removes the entry when the client disconnects.
 #
@@ -30,10 +29,8 @@
 #   - After identification, client <-> server messages are raw application
 #     bytes (no peer_index - the TCP connection already identifies the
 #     client).
-#   - USB event payload to host = device_id_len:u8 + device_id_bytes +
-#     application data.
-#   - Outbound from host (MSG_COMMAND) payload = device_id_len:u8 +
-#     device_id_bytes + message bytes.
+#   - USB event payload to host = device_id:u16 + application data.
+#   - Outbound from host (MSG_COMMAND) payload = device_id:u16 + message bytes.
 
 import os
 import json
@@ -297,7 +294,7 @@ class WiFiServer:
             self.disconnected += 1
             if self.debug:
                 print("WiFiServer: Client disconnected: %s (device: %s)" %
-                      (str(client_ip), device_id if device_id else "unknown"))
+                      (str(client_ip), device_id if device_id is not None else "unknown"))
 
     def enableNode(self, mac, lmk=None):
         """Authorize a client MAC address to connect.
@@ -406,7 +403,7 @@ class WiFiServer:
         """Handle a new TCP connection.
 
         The first frame on the connection MUST be the identification packet
-        (0x00 + device_id). Until it is received the client stays in the
+        (device_id:u16 little-endian). Until it is received the client stays in the
         awaiting_id state and any data is rejected as a malformed first
         frame.
         """
@@ -450,7 +447,7 @@ class WiFiServer:
         """Process data received from a client.
 
         The first frame on a new connection must be the identification
-        packet: 0x00 (marker) + device_id (UTF-8 bytes). Subsequent
+        packet: device_id:u16 (little-endian). Subsequent
         frames carry raw application data.
         """
         if self.debug:
@@ -469,21 +466,15 @@ class WiFiServer:
         sock, client_device, awaiting_id = self.clients[client_ip]
 
         if awaiting_id:
-            # Identification packet: 0x00 + device_id
-            if len(data) < 2 or data[0] != 0x00:
+            # Identification packet: device_id:u16
+            if len(data) != 2:
                 if self.debug:
                     print("WiFiServer: ERROR - first packet not identification")
                 self.rejected += 1
                 self._close_client(client_ip)
                 return
 
-            device_id = data[1:].decode("utf-8", "replace")
-            if not device_id:
-                if self.debug:
-                    print("WiFiServer: ERROR - empty device id")
-                self.rejected += 1
-                self._close_client(client_ip)
-                return
+            device_id = int.from_bytes(data[:2], "little")
 
             # Drop any stale mapping from a previous session of this IP.
             old_device = self.device_by_ip.pop(client_ip, None)
@@ -510,10 +501,9 @@ class WiFiServer:
             except Exception as e:
                 print("WiFiServer: Message decode error:", e)
 
-        # Forward to USB gateway as device_id + message
+        # Forward to USB gateway as device_id:u16 + message
         if self.gateway:
-            device_bytes = client_device.encode("utf-8") if client_device else b""
-            payload = bytes([len(device_bytes)]) + device_bytes + message
+            payload = int(client_device).to_bytes(2, "little") + message
             if self.gateway.send(
                 self.channel_id,
                 MSG_EVENT,
@@ -530,7 +520,7 @@ class WiFiServer:
     def _handle_outbound(self, msg_type, payload):
         """Handle outbound messages from the host.
 
-        MSG_COMMAND payload: device_id_len:u8 + device_id_bytes + message_bytes
+        MSG_COMMAND payload: device_id: u16 + message_bytes
 
         Returns:
             1 on success
@@ -541,17 +531,12 @@ class WiFiServer:
             print("WiFiServer: Outbound msg_type=%d, payload_len=%d" % (msg_type, len(payload)))
 
         if msg_type == MSG_COMMAND:
-            if len(payload) < 1:
-                print("WiFiServer: ERROR - no device id length")
+            if len(payload) < 2:
+                print("WiFiServer: ERROR - no device id")
                 return -1
 
-            device_id_len = payload[0]
-            if len(payload) < 1 + device_id_len:
-                print("WiFiServer: ERROR - truncated device id")
-                return -1
-
-            device_id = payload[1:1 + device_id_len].decode("utf-8", "replace")
-            message_bytes = payload[1 + device_id_len:]
+            device_id = int.from_bytes(payload[:2], "little")
+            message_bytes = payload[2:]
 
             client_ip = self.ip_by_device.get(device_id)
             if client_ip is None or client_ip not in self.clients:
@@ -630,12 +615,12 @@ class WiFiServer:
         return len(self.clients)
 
     def get_client_list(self):
-        """Return list of connected clients with IP and device id."""
+        """Return list of connected clients with IP and numeric device ID."""
         result = []
         for client_ip, (sock, device_id, _awaiting) in self.clients.items():
             result.append({
                 "ip": client_ip,
-                "device": device_id if device_id else "",
+                "device": device_id if device_id is not None else 0,
                 "mac": "",
             })
         return result
