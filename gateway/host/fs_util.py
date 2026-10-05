@@ -26,6 +26,9 @@ import time
 import usb.core
 import usb.util
 
+import sys
+
+
 try:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
@@ -120,11 +123,18 @@ class USBGateway:
         self.last_response = None
         self.last_error = None
 
+        if sys.platform == "win32":
+            import libusb_package
+            self.backend = libusb_package.get_libusb1_backend()
+        else:
+            self.backend = None
+
     def _find(self):
         devices = usb.core.find(
             find_all=True,
             idVendor=VID,
             idProduct=PID,
+            backend=self.backend
         )
         for dev in devices:
             if self.serial is None:
