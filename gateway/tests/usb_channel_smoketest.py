@@ -597,6 +597,76 @@ def run_scenario(sync_in):
 
 
 # --- bulk/HID transport mux ---------------------------------------------
+def test_host_hid_mtu_layering():
+    """MTU_USB frames survive HID's smaller physical report payload."""
+    host_dir = os.path.join(ROOT, "host")
+    if host_dir not in sys.path:
+        sys.path.insert(0, host_dir)
+    import usbInterface as host_usb
+
+    class FakeHID:
+        def __init__(self):
+            self.writes = []
+            self.reads = []
+
+        def write(self, report):
+            report = bytes(report)
+            self.writes.append(report)
+            return len(report)
+
+        def read(self, size, timeout_ms=0):
+            assert size == host_usb.HID_REPORT_SIZE
+            return self.reads.pop(0) if self.reads else b""
+
+    iface = host_usb.USBInterface()
+    iface.transport = "hid"
+    iface.dev = FakeHID()
+
+    payload = bytes((i & 0xff for i in range(host_usb.MTU_USB)))
+    encoded = host_usb.make_frame(7, 0x01, payload)
+    assert len(encoded) == 4 + host_usb.MTU_USB
+
+    iface._write_stream(encoded)
+    expected_reports = (len(encoded) + host_usb.HID_DATA_SIZE - 1) // host_usb.HID_DATA_SIZE
+    assert len(iface.dev.writes) == expected_reports
+
+    reconstructed = bytearray()
+    for wire_report in iface.dev.writes:
+        # hidapi write buffer: report-id 0 + 64-byte HID report.
+        assert len(wire_report) == 1 + host_usb.HID_REPORT_SIZE
+        assert wire_report[0] == 0
+        report = wire_report[1:]
+        count = report[0]
+        assert 0 < count <= host_usb.HID_DATA_SIZE
+        reconstructed.extend(report[1:1 + count])
+    assert bytes(reconstructed) == encoded
+
+    # Exercise the reverse direction too: physical HID reports are converted
+    # back into the same byte stream before USBChannel frame parsing.
+    for offset in range(0, len(encoded), host_usb.HID_DATA_SIZE):
+        chunk = encoded[offset:offset + host_usb.HID_DATA_SIZE]
+        iface.dev.reads.append(
+            bytes((len(chunk),)) + chunk + bytes(host_usb.HID_DATA_SIZE - len(chunk))
+        )
+    parser = host_usb.FrameParser()
+    decoded = []
+    while iface.dev.reads:
+        decoded.extend(parser.feed(iface._read_stream(100)))
+    assert decoded == [(7, 0x01, payload)]
+
+    # MTU_USB is the protocol payload limit; HID_DATA_SIZE is deliberately
+    # smaller and must not leak into application-level fragmentation.
+    assert host_usb.HID_DATA_SIZE < host_usb.MTU_USB
+    try:
+        host_usb.make_frame(7, 0x01, bytes(host_usb.MTU_USB + 1))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("MTU_USB + 1 payload was not rejected")
+
+    print("PASS: host HID chunks MTU_USB frames below the protocol MTU")
+
+
 def test_transport_mux():
     """Default bulk, HID_ENABLE via HID, HID_DISABLE via bulk, reset->bulk."""
     COUT, CIN, HOUT, HIN = 0x03, 0x83, 0x04, 0x84
@@ -712,6 +782,7 @@ def test_transport_mux():
     print("PASS: USB transport mux custom -> HID -> custom, reset -> custom")
 
 
+test_host_hid_mtu_layering()
 test_transport_mux()
 
 trace_sync = run_scenario(sync_in=True)

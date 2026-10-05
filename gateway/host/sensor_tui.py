@@ -3,8 +3,8 @@
 """Fedora terminal UI for the AtomS3U USB sensor gateway.
 
 Host counterpart of the MicroPython application sensor_test.py. Talks to
-the device's vendor-specific bulk interface (interface 2, EP 0x03 OUT /
-EP 0x83 IN) using the 4-byte framing defined by usb_channel_server.py:
+the uniform host USB interface (bulk on Linux, HID on Windows) using the
+4-byte framing defined by usb_channel_server.py:
 channel:u8, msg_type:u8, length:u16 le, payload.
 
 A background reader thread parses frames into an event queue; the curses
@@ -15,7 +15,7 @@ Keys: r/g/b/w/y set the LED colour, 0 turns it off, p ping, c channel
 list, d toggle device debug, s request gateway status, x clear the
 device debug log, Enter send message, q (or ESC) quit.
 
-Requires pyusb. Optional --serial selects among several attached boards.
+Requires pyusb on Linux or hidapi on Windows. Optional --serial selects among several attached boards.
 Use -e for ESP-NOW mode or -w for WiFi mode.
 """
 
@@ -33,8 +33,6 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import usb.core
-import usb.util
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
 from channel_defs import (
@@ -62,13 +60,6 @@ from channel_defs import (
     CHANNEL_WIFI,
 )
 
-VID = 0x303A
-PID = 0x4001
-INTERFACE = 2
-EP_OUT = 0x03
-EP_IN = 0x83
-
-
 @dataclass
 class ChannelInfo:
     channel_id: int
@@ -78,210 +69,7 @@ class ChannelInfo:
     name: str
 
 
-class ProtocolError(Exception):
-    pass
-
-
-class USBDisconnected(Exception):
-    pass
-
-
-class FrameParser:
-    """Incremental parser for the 4-byte framed protocol. Invalid headers abort the buffer."""
-
-    def __init__(self, max_payload=4096):
-        self.buffer = bytearray()
-        self.max_payload = max_payload
-
-    def feed(self, data):
-        self.buffer.extend(data)
-        frames = []
-
-        while len(self.buffer) >= 4:
-            channel = self.buffer[0]
-            msg_type = self.buffer[1]
-            length = self.buffer[2] | (self.buffer[3] << 8)
-
-            if channel == 255 or length > self.max_payload:
-                self.buffer.clear()
-                raise ProtocolError(
-                    "invalid header channel=%d length=%d"
-                    % (channel, length)
-                )
-
-            total = 4 + length
-            if len(self.buffer) < total:
-                break
-
-            payload = bytes(self.buffer[4:total])
-            del self.buffer[:total]
-            frames.append((channel, msg_type, payload))
-
-        return frames
-
-
-class USBGateway:
-    """PyUSB transport. Reader thread delivers (kind, data) tuples on .events.
-
-    kind is "frame" with (channel, msg_type, payload) or "error" with a
-    text description. The event queue drops its oldest entry when full so
-    the device is never blocked by a slow consumer.
-    """
-
-    def __init__(self, serial=None, timeout_ms=100):
-        self.serial = serial
-        self.timeout_ms = timeout_ms
-        self.dev = None
-        self.claimed = False
-        self.stop_event = threading.Event()
-        self.reader_thread = None
-        self.write_lock = threading.Lock()
-        self.events = queue.Queue(maxsize=256)
-        self.parser = FrameParser()
-        self.rx_bytes = 0
-        self.tx_bytes = 0
-        self.errors = 0
-        self.reader_alive = False
-        self.reader_last_error = ""
-
-    def _find(self):
-        devices = usb.core.find(
-            find_all=True,
-            idVendor=VID,
-            idProduct=PID,
-        )
-        for dev in devices:
-            if self.serial is None:
-                return dev
-            try:
-                if usb.util.get_string(dev, dev.iSerialNumber) == self.serial:
-                    return dev
-            except usb.core.USBError:
-                continue
-        return None
-
-    def open(self):
-        """Locate the device, claim the vendor interface and start the reader thread."""
-        dev = self._find()
-        if dev is None:
-            raise USBDisconnected("device not found")
-
-        try:
-            dev.set_configuration()
-        except usb.core.USBError as exc:
-            if getattr(exc, "errno", None) != 16:
-                raise
-
-        if dev.is_kernel_driver_active(INTERFACE):
-            raise RuntimeError("kernel driver owns interface 2")
-
-        usb.util.claim_interface(dev, INTERFACE)
-        self.dev = dev
-        self.claimed = True
-        self.stop_event.clear()
-        self.reader_thread = threading.Thread(
-            target=self._reader,
-            daemon=True,
-        )
-        self.reader_thread.start()
-
-    def close(self):
-        """Stop the reader, release the interface and dispose USB resources."""
-        self.stop_event.set()
-
-        if self.reader_thread is not None:
-            self.reader_thread.join(timeout=1.0)
-            self.reader_thread = None
-
-        dev = self.dev
-        self.dev = None
-
-        if dev is not None:
-            try:
-                if self.claimed:
-                    usb.util.release_interface(dev, INTERFACE)
-            finally:
-                self.claimed = False
-                usb.util.dispose_resources(dev)
-
-    def send(self, channel, msg_type, payload=b""):
-        """Send one frame. Raises USBDisconnected on device loss or short write."""
-        if self.dev is None:
-            raise USBDisconnected("device is not open")
-
-        frame = (
-            bytes((
-                channel,
-                msg_type,
-                len(payload) & 0xFF,
-                (len(payload) >> 8) & 0xFF,
-            ))
-            + payload
-        )
-
-        try:
-            with self.write_lock:
-                written = self.dev.write(
-                    EP_OUT,
-                    frame,
-                    timeout=1000,
-                )
-            if written != len(frame):
-                raise USBDisconnected(
-                    "short write %d/%d" % (written, len(frame))
-                )
-            self.tx_bytes += written
-        except usb.core.USBError as exc:
-            self.errors += 1
-            raise USBDisconnected(str(exc)) from exc
-
-    def _put_event(self, event):
-        try:
-            self.events.put_nowait(event)
-        except queue.Full:
-            try:
-                self.events.get_nowait()
-            except queue.Empty:
-                pass
-            self.events.put_nowait(event)
-
-    def _reader(self):
-        """Reader thread: read bursts from EP_IN, parse and enqueue frames."""
-        self.reader_alive = True
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    data = bytes(
-                        self.dev.read(
-                            EP_IN,
-                            4096,
-                            timeout=self.timeout_ms,
-                        )
-                    )
-                    self.rx_bytes += len(data)
-                    for frame in self.parser.feed(data):
-                        self._put_event(("frame", frame))
-                except usb.core.USBTimeoutError:
-                    continue
-                except ProtocolError as exc:
-                    self.errors += 1
-                    if not self.stop_event.is_set():
-                        self._put_event(("error", "protocol: " + str(exc)))
-                    continue
-                except usb.core.USBError as exc:
-                    self.errors += 1
-                    if not self.stop_event.is_set():
-                        self._put_event(("error", "usb: " + str(exc)))
-                    return
-        except Exception as exc:
-            self.errors += 1
-            self.reader_last_error = "%s: %s" % (type(exc).__name__, exc)
-            if not self.stop_event.is_set():
-                self._put_event(("error", "reader stopped: " + self.reader_last_error))
-        finally:
-            self.reader_alive = False
-
-
+from usbInterface import USBInterface, ProtocolError, USBDisconnected
 
 def parse_channels(payload):
     """Decode a channel-list payload into {channel_id: ChannelInfo}."""
@@ -894,7 +682,7 @@ def main():
     if args.espnow and args.wifi:
         raise SystemExit("Error: -e (espnow) and -w (wifi) cannot be used together")
 
-    gateway = USBGateway(serial=args.serial)
+    gateway = USBInterface(serial=args.serial, threaded=True)
     tui = TUI(gateway, use_wifi=args.wifi, use_espnow=args.espnow)
 
     def shutdown_handler(signum, frame):

@@ -3,7 +3,7 @@
 """Filesystem operations tool for the AtomS3U USB sensor gateway.
 
 Host counterpart of the MicroPython filesystem handlers. Talks to the device's
-vendor-specific bulk interface (interface 2, EP 0x03 OUT / EP 0x83 IN) using
+uniform host USB interface using bulk on Linux and HID on Windows, with
 the 4-byte framing defined by usb_channel_server.py.
 
 Commands:
@@ -13,7 +13,7 @@ Commands:
   rm <path>     - Delete file from device
   exists <path> - Check if file exists on device
 
-Requires pyusb. Optional --serial selects among several attached boards.
+Requires pyusb on Linux or hidapi on Windows. Optional --serial selects among several attached boards.
 """
 
 from __future__ import annotations
@@ -23,10 +23,6 @@ import os
 import sys
 import time
 
-import usb.core
-import usb.util
-
-import sys
 
 
 try:
@@ -60,214 +56,29 @@ from channel_defs import (
     MTU_USB
 )
 
-VID = 0x303A
-PID = 0x4001
-INTERFACE = 2
-EP_OUT = 0x03
-EP_IN = 0x83
+from usbInterface import USBInterface, ProtocolError, USBDisconnected
 
 
-class ProtocolError(Exception):
-    pass
-
-
-class USBDisconnected(Exception):
-    pass
-
-
-class FrameParser:
-    """Incremental parser for the 4-byte framed protocol."""
-
-    def __init__(self, max_payload=4096):
-        self.buffer = bytearray()
-        self.max_payload = max_payload
-
-    def feed(self, data):
-        self.buffer.extend(data)
-        frames = []
-
-        while len(self.buffer) >= 4:
-            channel = self.buffer[0]
-            msg_type = self.buffer[1]
-            length = self.buffer[2] | (self.buffer[3] << 8)
-
-            if channel == 255 or length > self.max_payload:
-                self.buffer.clear()
-                raise ProtocolError(
-                    "invalid header channel=%d length=%d"
-                    % (channel, length)
-                )
-
-            total = 4 + length
-            if len(self.buffer) < total:
-                break
-
-            payload = bytes(self.buffer[4:total])
-            del self.buffer[:total]
-            frames.append((channel, msg_type, payload))
-
-        return frames
-
-
-class USBGateway:
-    """PyUSB transport for filesystem operations."""
-
-    def __init__(self, serial=None, timeout_ms=100):
-        self.serial = serial
-        self.timeout_ms = timeout_ms
-        self.dev = None
-        self.claimed = False
-        self.parser = FrameParser()
-        self.write_lock = None
-        self.response_event = None
-        self.last_response = None
-        self.last_error = None
-
-        if sys.platform == "win32":
-            import libusb_package
-            self.backend = libusb_package.get_libusb1_backend()
-        else:
-            self.backend = None
-
-    def _find(self):
-        devices = usb.core.find(
-            find_all=True,
-            idVendor=VID,
-            idProduct=PID,
-            backend=self.backend
-        )
-        for dev in devices:
-            if self.serial is None:
-                return dev
-            try:
-                if usb.util.get_string(dev, dev.iSerialNumber) == self.serial:
-                    return dev
-            except usb.core.USBError:
-                continue
-        return None
-
-    def open(self):
-        """Locate the device and claim the vendor interface."""
-        dev = self._find()
-        if dev is None:
-            raise USBDisconnected("device not found")
-
-        try:
-            dev.set_configuration()
-        except usb.core.USBError as exc:
-            if getattr(exc, "errno", None) != 16:
-                raise
-
-        if dev.is_kernel_driver_active(INTERFACE):
-            raise RuntimeError("kernel driver owns interface 2")
-
-        usb.util.claim_interface(dev, INTERFACE)
-        self.dev = dev
-        self.claimed = True
-        self.write_lock = __import__("threading").Lock()
-
-    def close(self):
-        """Release the interface and dispose USB resources."""
-        dev = self.dev
-        self.dev = None
-
-        if dev is not None:
-            try:
-                if self.claimed:
-                    usb.util.release_interface(dev, INTERFACE)
-            finally:
-                self.claimed = False
-                usb.util.dispose_resources(dev)
-
-    def send(self, channel, msg_type, payload=b""):
-        """Send one frame. Raises USBDisconnected on device loss or short write."""
-        if self.dev is None:
-            raise USBDisconnected("device is not open")
-
-        frame = (
-            bytes((
-                channel,
-                msg_type,
-                len(payload) & 0xFF,
-                (len(payload) >> 8) & 0xFF,
-            ))
-            + payload
-        )
-
-        try:
-            with self.write_lock:
-                written = self.dev.write(
-                    EP_OUT,
-                    frame,
-                    timeout=1000,
-                )
-            if written != len(frame):
-                raise USBDisconnected(
-                    "short write %d/%d" % (written, len(frame))
-                )
-        except usb.core.USBError as exc:
-            raise USBDisconnected(str(exc)) from exc
-
-    def read_response(self, timeout_ms=5000):
-        """Read a response from the device."""
-        if self.dev is None:
-            raise USBDisconnected("device is not open")
-
-        start_time = time.time()
-        while (time.time() - start_time) * 1000 < timeout_ms:
-            try:
-                data = bytes(
-                    self.dev.read(
-                        EP_IN,
-                        4096,
-                        timeout=self.timeout_ms,
-                    )
-                )
-                for frame in self.parser.feed(data):
-                    channel, msg_type, payload = frame
-                    if channel == CHANNEL_CONTROL:
-                        if msg_type == MSG_FS_RESPONSE:
-                            return payload
-                        elif msg_type == MSG_ERROR:
-                            related = payload[0] if len(payload) > 0 else -1
-                            code = payload[1] if len(payload) > 1 else -1
-                            text = payload[2:].decode("utf-8", "replace")
-                            raise ProtocolError(
-                                "device error ch=%d code=%d: %s"
-                                % (related, code, text)
-                            )
-            except usb.core.USBTimeoutError:
-                continue
-
-        raise ProtocolError("timeout waiting for response")
-
-    def ping(self):
-        """Send ping and wait for pong."""
-        self.send(CHANNEL_CONTROL, MSG_PING)
-        start_time = time.time()
-        while (time.time() - start_time) * 1000 < 5000:
-            try:
-                data = bytes(
-                    self.dev.read(
-                        EP_IN,
-                        4096,
-                        timeout=100,
-                    )
-                )
-                for frame in self.parser.feed(data):
-                    channel, msg_type, payload = frame
-                    if channel == CHANNEL_CONTROL and msg_type == MSG_PONG:
-                        return True
-            except usb.core.USBTimeoutError:
-                continue
+def read_fs_response(gateway, timeout_ms=5000):
+    """Wait for a filesystem response while preserving transport independence."""
+    def predicate(channel, msg_type, payload):
+        if channel != CHANNEL_CONTROL:
+            return False
+        if msg_type == MSG_FS_RESPONSE:
+            return True
+        if msg_type == MSG_ERROR:
+            related = payload[0] if len(payload) > 0 else -1
+            code = payload[1] if len(payload) > 1 else -1
+            text = payload[2:].decode("utf-8", "replace")
+            raise ProtocolError("device error ch=%d code=%d: %s" % (related, code, text))
         return False
-
+    return gateway.read_until(predicate, timeout_ms)[2]
 
 def fs_list(gateway, path="/"):
     """List directory contents on the device."""
     payload = bytes((CTRL_FS_LIST,)) + path.encode("utf-8")
     gateway.send(CHANNEL_CONTROL, MSG_COMMAND, payload)
-    response = gateway.read_response()
+    response = read_fs_response(gateway)
 
     if not response:
         return []
@@ -315,7 +126,7 @@ def fs_read(gateway, path, max_size=None):
         extra = _u32(offset) + _u32(size)
         payload = bytes((CTRL_FS_READ,)) + path_bytes + b"\0" + extra
         gateway.send(CHANNEL_CONTROL, MSG_COMMAND, payload)
-        data = gateway.read_response()
+        data = read_fs_response(gateway)
 
         if not data:
             break
@@ -346,7 +157,7 @@ def fs_write(gateway, path, data):
         offset_bytes = _u32(offset)
         payload = bytes((CTRL_FS_WRITE,)) + path_bytes + b"\0" + offset_bytes + chunk
         gateway.send(CHANNEL_CONTROL, MSG_COMMAND, payload)
-        response = gateway.read_response()
+        response = read_fs_response(gateway)
         if len(response) >= 4:
             written = int.from_bytes(response[:4], "little")
             total_written += written
@@ -359,7 +170,7 @@ def fs_delete(gateway, path):
     """Delete a file from the device."""
     payload = bytes((CTRL_FS_DELETE,)) + path.encode("utf-8")
     gateway.send(CHANNEL_CONTROL, MSG_COMMAND, payload)
-    response = gateway.read_response()
+    response = read_fs_response(gateway)
     return len(response) > 0 and response[0] == 1
 
 
@@ -367,13 +178,13 @@ def fs_exists(gateway, path):
     """Check if a file exists on the device."""
     payload = bytes((CTRL_FS_EXISTS,)) + path.encode("utf-8")
     gateway.send(CHANNEL_CONTROL, MSG_COMMAND, payload)
-    response = gateway.read_response()
+    response = read_fs_response(gateway)
     return len(response) > 0 and response[0] == 1
 
 
 def cmd_ls(args):
     """Execute ls command."""
-    gateway = USBGateway(serial=args.device_serial)
+    gateway = USBInterface(serial=args.device_serial)
     try:
         gateway.open()
         if not gateway.ping():
@@ -396,7 +207,7 @@ def cmd_ls(args):
 
 def cmd_cat(args):
     """Execute cat command."""
-    gateway = USBGateway(serial=args.device_serial)
+    gateway = USBInterface(serial=args.device_serial)
     try:
         gateway.open()
         if not gateway.ping():
@@ -429,7 +240,7 @@ def cmd_put(args):
     """Execute put command (write local file to device)."""
     dest = args.dest if args.dest else os.path.basename(args.src)
 
-    gateway = USBGateway(serial=args.device_serial)
+    gateway = USBInterface(serial=args.device_serial)
     try:
         gateway.open()
         if not gateway.ping():
@@ -451,7 +262,7 @@ def cmd_put(args):
 
 def cmd_rm(args):
     """Execute rm command (delete file from device)."""
-    gateway = USBGateway(serial=args.device_serial)
+    gateway = USBInterface(serial=args.device_serial)
     try:
         gateway.open()
         if not gateway.ping():
@@ -473,7 +284,7 @@ def cmd_rm(args):
 
 def cmd_exists(args):
     """Execute exists command."""
-    gateway = USBGateway(serial=args.device_serial)
+    gateway = USBInterface(serial=args.device_serial)
     try:
         gateway.open()
         if not gateway.ping():
@@ -495,7 +306,7 @@ def cmd_exists(args):
 
 def cmd_reset(args):
     """Reset the device via machine.reset()."""
-    gateway = USBGateway(serial=args.device_serial)
+    gateway = USBInterface(serial=args.device_serial)
     try:
         gateway.open()
         payload = bytes((CTRL_RESET,))

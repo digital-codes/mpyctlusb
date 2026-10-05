@@ -767,3 +767,33 @@ BUSID  VID:PID    DEVICE                                                        
 
 Device should be usable with *mpremote* from WIN and WSL now
   
+
+### Unified host USB interface
+
+Host applications use `host/usbInterface.py` instead of maintaining their own
+PyUSB implementations. `USBInterface` presents the same framed protocol API on
+both supported host transports:
+
+- **Linux:** vendor-specific bulk interface 2 (`0x03` OUT / `0x83` IN). `open()`
+  sends `HID_DISABLE`, so a still-powered gateway is recovered to custom/bulk
+  mode even if a previous host selected HID.
+- **Windows:** vendor-defined HID interface 3. `open()` sends `HID_ENABLE` and
+  validates the status response before returning. The gateway byte stream is
+  split into HID reports with one length byte plus up to 63 stream bytes.
+
+`MTU_USB` remains the USBChannel **payload** MTU (currently 960 bytes) on both
+Linux bulk and Windows HID.  Windows HID has a smaller physical transport chunk
+(`HID_DATA_SIZE = 63`), but `USBInterface` hides that difference by spreading a
+complete `4 + MTU_USB` USBChannel frame over as many HID reports as required.
+Host applications must therefore fragment logical protocol operations against
+`MTU_USB` (including their own command overhead), never against the HID report
+size. `USBInterface.make_frame()` and its parser enforce `MTU_USB`; the HID
+backend independently enforces/chunks to `HID_DATA_SIZE`.
+
+The common API is `open()`, `close()`, `send()`, `read_frame()`, `read_until()`
+and `ping()`. Applications that need continuous asynchronous input (currently
+`sensor_tui.py`) construct `USBInterface(..., threaded=True)` and consume the
+existing `events` queue. `fs_util.py` and `channel_loader.py` use synchronous
+reads. This keeps USB transport selection and framing out of application code.
+
+Host dependencies are `pyusb` on Linux and `hidapi` on Windows.
