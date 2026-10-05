@@ -297,11 +297,27 @@ sys.modules["usb"] = usb_pkg
 sys.modules["usb.core"] = usb_core
 sys.modules["usb.util"] = usb_util
 
+# sensor_tui imports curses, which is not part of the standard CPython
+# Windows distribution.  The smoke test exercises only its parsers/state,
+# not terminal rendering, so a minimal import stub keeps the test portable.
+try:
+    import curses  # noqa: F401
+except ImportError:
+    curses = types.ModuleType("curses")
+    curses.KEY_ENTER = 343
+    curses.KEY_BACKSPACE = 263
+    curses.KEY_UP = 259
+    curses.KEY_DOWN = 258
+    curses.curs_set = lambda *_args, **_kwargs: None
+    curses.wrapper = lambda func, *args, **kwargs: func(None, *args, **kwargs)
+    sys.modules["curses"] = curses
+
 # --- real modules under test -----------------------------------------
 sys.path.insert(0, STICK)
 sys.path.insert(0, HOST)
 sys.path.insert(0, COMMON)
 import usb_channel_server as ucs
+import usb_transport_mux
 import sensor_test
 import espnow_server
 import sensor_tui
@@ -574,6 +590,125 @@ def run_scenario(sync_in):
     return trace
 
 
+
+# --- bulk/HID transport mux ---------------------------------------------
+def test_transport_mux():
+    """Default bulk, HID_ENABLE via HID, HID_DISABLE via bulk, reset->bulk."""
+    COUT, CIN, HOUT, HIN = 0x03, 0x83, 0x04, 0x84
+    LOUT, LIN = 0x01, 0x81
+
+    class PhysicalUSBD:
+        def __init__(self):
+            self.out_buffers = {}
+            self.tx = []
+            self.mux = None
+
+        def submit_xfer(self, ep, buf):
+            if ep in (COUT, HOUT):
+                self.out_buffers[ep] = buf
+                return True
+            data = bytes(buf)
+            self.tx.append((ep, data))
+            # Exercise the synchronous-completion path.
+            self.mux.on_transfer_complete(ep, 0, len(data))
+            return True
+
+        def inject(self, ep, data):
+            buf = self.out_buffers.pop(ep)
+            buf[:len(data)] = data
+            self.mux.on_transfer_complete(ep, 0, len(data))
+
+    def frame(msg_type, payload=b""):
+        return bytes((0, msg_type, len(payload) & 0xff, len(payload) >> 8)) + payload
+
+    def hid_report(data):
+        assert len(data) <= usb_transport_mux.HID_DATA_SIZE
+        return bytes((len(data),)) + data + bytes(usb_transport_mux.HID_DATA_SIZE - len(data))
+
+    def tx_stream(dev, ep):
+        result = bytearray()
+        for tx_ep, raw in dev.tx:
+            if tx_ep != ep:
+                continue
+            if ep == HIN:
+                count = raw[0]
+                assert count <= usb_transport_mux.HID_DATA_SIZE
+                result.extend(raw[1:1 + count])
+            else:
+                result.extend(raw)
+        return bytes(result)
+
+    dev = PhysicalUSBD()
+    mux = usb_transport_mux.USBTransportMux(
+        dev, COUT, CIN, HOUT, HIN, LOUT, LIN
+    )
+    dev.mux = mux
+    server = ucs.USBChannelServer(
+        mux, interface=2, ep_out=LOUT, ep_in=LIN
+    )
+    mux.set_complete_callback(server.on_transfer_complete)
+    mux.on_interface_open(2)
+    mux.on_interface_open(3)
+    server.on_interface_open()
+
+    # Regression for a314d8f: channel/media packet limits are independent
+    # from the USB frame MTU.  WiFi-sized channels may therefore advertise
+    # max_packet > MTU_USB; protocol-level fragmentation handles USB.
+    server.register_channel(42, 3, ucs.DIR_BIDI, 1400, "mtu-test", lambda *_: 1, announce=False)
+    assert server.channels[42]["max_packet"] == 1400
+
+    assert mux.active_name() == "custom"
+
+    # Normal traffic on inactive HID is ignored.
+    dev.inject(HOUT, hid_report(frame(ucs.MSG_PING)))
+    assert dev.tx == []
+
+    # Default custom path works.
+    dev.inject(COUT, frame(ucs.MSG_PING))
+    assert parse(tx_stream(dev, CIN)) == (0, ucs.MSG_PONG, b"AS3U\x01")
+    dev.tx.clear()
+
+    # HID_ENABLE is accepted only through HID.  Its status ACK must already
+    # travel through HID, proving that the switch happened before dispatch.
+    enable = frame(ucs.MSG_COMMAND, bytes((ucs.CTRL_HID_ENABLE,)))
+    dev.inject(HOUT, hid_report(enable))
+    assert mux.active_name() == "hid"
+    hid_bytes = tx_stream(dev, HIN)
+    assert parse(hid_bytes)[0:2] == (0, ucs.MSG_STATUS)
+    assert tx_stream(dev, CIN) == b""
+    dev.tx.clear()
+
+    # Normal traffic on custom is ignored while HID is active.
+    dev.inject(COUT, frame(ucs.MSG_PING))
+    assert dev.tx == []
+
+    # HID carries ordinary protocol traffic now.
+    dev.inject(HOUT, hid_report(frame(ucs.MSG_PING)))
+    assert parse(tx_stream(dev, HIN)) == (0, ucs.MSG_PONG, b"AS3U\x01")
+    dev.tx.clear()
+
+    # HID_DISABLE is deliberately sent through the inactive custom path.
+    disable = frame(ucs.MSG_COMMAND, bytes((ucs.CTRL_HID_DISABLE,)))
+    dev.inject(COUT, disable)
+    assert mux.active_name() == "custom"
+    custom_bytes = tx_stream(dev, CIN)
+    assert parse(custom_bytes)[0:2] == (0, ucs.MSG_STATUS)
+    assert tx_stream(dev, HIN) == b""
+    dev.tx.clear()
+
+    # Custom works again, and reset always restores custom.
+    dev.inject(COUT, frame(ucs.MSG_PING))
+    assert parse(tx_stream(dev, CIN)) == (0, ucs.MSG_PONG, b"AS3U\x01")
+    mux.mode = usb_transport_mux.TRANSPORT_HID
+    mux.on_usb_reset()
+    server.on_usb_reset()
+    assert mux.active_name() == "custom"
+
+    print("PASS: USB transport mux custom -> HID -> custom, reset -> custom")
+
+
+test_transport_mux()
+
 trace_sync = run_scenario(sync_in=True)
 trace_async = run_scenario(sync_in=False)
 assert trace_sync == trace_async, "sync/async IN completion must be indistinguishable"
@@ -604,8 +739,8 @@ class FakeGateway:
 ws = wifi_server.WiFiServer(channel_id=3, debug=False)
 ws.gateway = FakeGateway()
 
-ws.clients["192.168.4.2"] = (None, "device1", False)
-ws.clients["192.168.4.3"] = (None, "device2", False)
+ws.clients["192.168.4.2"] = (None, 1, False)
+ws.clients["192.168.4.3"] = (None, 2, False)
 
 assert len(ws.clients) == 2
 assert "192.168.4.2" in ws.clients
@@ -616,8 +751,8 @@ ips = [c["ip"] for c in client_list]
 devices = [c["device"] for c in client_list]
 assert "192.168.4.2" in ips
 assert "192.168.4.3" in ips
-assert "device1" in devices
-assert "device2" in devices
+assert 1 in devices
+assert 2 in devices
 debug("WiFi client tracking test passed")
 
 debug("Testing identification packet handling...")
@@ -631,17 +766,17 @@ debug("WiFi identification rejection passed")
 
 # Accept identification packet: 0x00 + device_id
 ws.clients["192.168.4.5"] = (None, None, True)
-ws._handle_client_data("192.168.4.5", b"\x00device3")
-assert ws.clients["192.168.4.5"][1] == "device3"
+ws._handle_client_data("192.168.4.5", (3).to_bytes(2, "little"))
+assert ws.clients["192.168.4.5"][1] == 3
 assert ws.clients["192.168.4.5"][2] == False
-assert ws.device_by_ip["192.168.4.5"] == "device3"
-assert ws.ip_by_device["device3"] == "192.168.4.5"
+assert ws.device_by_ip["192.168.4.5"] == 3
+assert ws.ip_by_device[3] == "192.168.4.5"
 debug("WiFi identification acceptance passed")
 
 # Outbound lookup: device_id resolves to IP via ip_by_device
-assert ws.ip_by_device["device3"] == "192.168.4.5"
+assert ws.ip_by_device[3] == "192.168.4.5"
 # Unknown device_id returns -2 (no socket call made)
-result = ws._handle_outbound(ucs.MSG_COMMAND, bytes([len(b"ghost")]) + b"ghost" + b"hi")
+result = ws._handle_outbound(ucs.MSG_COMMAND, (999).to_bytes(2, "little") + b"hi")
 assert result == -2
 debug("WiFi outbound lookup passed")
 
@@ -652,27 +787,26 @@ assert tui.use_wifi == True
 assert tui.wifi_clients == []
 
 # New payload format: device_id_len(1) + device_id + message
-device_id = b"device1"
-test_payload = bytes([len(device_id)]) + device_id + b"hello world"
+device_id = 1
+test_payload = device_id.to_bytes(2, "little") + b"hello world"
 tui.handle_frame(3, ucs.MSG_EVENT, test_payload)
 
-assert "device1" in tui.wifi_clients
+assert 1 in tui.wifi_clients
 debug("TUI WiFi client handling test passed")
 
 debug("Testing TUI WiFi client list sync...")
 
-# Build sync payload: count(1) + for each: ip_len + ip + device_len + device + mac_len + mac
+# Build sync payload: count + ip_len + ip + device_id:u16 + mac_len + mac
 ip_bytes = b"192.168.4.3"
-device_bytes = b"device2"
 mac_bytes = b"unknown"
 sync_payload = bytes([1])
 sync_payload += bytes([len(ip_bytes)]) + ip_bytes
-sync_payload += bytes([len(device_bytes)]) + device_bytes
+sync_payload += (2).to_bytes(2, "little")
 sync_payload += bytes([len(mac_bytes)]) + mac_bytes
 tui._parse_wifi_clients(sync_payload)
 
-assert "device1" in tui.wifi_clients
-assert "device2" in tui.wifi_clients
+assert 1 in tui.wifi_clients
+assert 2 in tui.wifi_clients
 debug("TUI WiFi client sync test passed")
 
 print("PASS: All WiFi-specific tests passed")

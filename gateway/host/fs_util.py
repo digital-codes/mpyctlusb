@@ -334,8 +334,15 @@ def fs_write(gateway, path, data):
     total_written = 0
     offset = 0
 
+    # The USB MTU applies to the complete control-frame payload, not only
+    # to the file bytes.  Account for command + path terminator + offset.
+    write_overhead = 1 + len(path_bytes) + 1 + 4
+    chunk_size = MTU_USB - write_overhead
+    if chunk_size <= 0:
+        raise ValueError("path too long for USB MTU")
+
     while offset < len(data):
-        chunk = data[offset:offset + MTU_USB]
+        chunk = data[offset:offset + chunk_size]
         offset_bytes = _u32(offset)
         payload = bytes((CTRL_FS_WRITE,)) + path_bytes + b"\0" + offset_bytes + chunk
         gateway.send(CHANNEL_CONTROL, MSG_COMMAND, payload)

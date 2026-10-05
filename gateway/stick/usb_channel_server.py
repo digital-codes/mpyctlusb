@@ -60,6 +60,8 @@ from channel_defs import (
     CTRL_FS_EXISTS,
     CTRL_LOAD_CHANNEL,
     CTRL_RESET,
+    CTRL_HID_ENABLE,
+    CTRL_HID_DISABLE,
     CHANNEL_WIFI,
     CHANNEL_BUTTON,
     CHANNEL_RGB,
@@ -225,7 +227,12 @@ class USBChannelServer:
             raise ValueError("channel id must be 0..254")
         if channel_id in self.channels:
             raise ValueError("duplicate channel id %d" % channel_id)
-        if not 0 <= max_packet <= self.max_payload:
+        # max_packet describes the logical packet limit of the channel/media.
+        # It is independent of max_payload, which is the USBChannel frame MTU.
+        # Larger logical packets are fragmented by the protocol layer before
+        # crossing USB (and, for radio channels, again for the target medium).
+        # The channel list encodes max_packet as u16.
+        if not 0 <= max_packet <= 0xFFFF:
             raise ValueError("invalid max_packet")
 
         name_bytes = name.encode("utf-8")
@@ -651,6 +658,13 @@ class USBChannelServer:
                 machine.reset()
             except Exception as exc:
                 self.send_error(CHANNEL_CONTROL, 32, "reset: %s" % repr(exc))
+            return
+
+        # The transport mux validates which physical transport these arrive on
+        # and switches before forwarding the command.  The server only returns
+        # a normal status ACK on the newly active transport.
+        if command in (CTRL_HID_ENABLE, CTRL_HID_DISABLE):
+            self.send(CHANNEL_CONTROL, MSG_STATUS, self._encode_status())
             return
 
         self.send_error(CHANNEL_CONTROL, 9, "unknown control command")

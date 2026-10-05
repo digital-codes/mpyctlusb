@@ -393,7 +393,21 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id=-1, device_m
     total_size = data_size
     test_data = b"T" * data_size
 
-    MAX_SEGMENT_SIZE = min(MTU_WIFI, MTU_USB) if use_wifi else MTU_ESPNOW
+    # MTU_* values limit the complete packet on their respective medium.
+    # Segment data sits below both the USB channel wrapper and the radio
+    # protocol wrapper, so subtract those bytes before choosing a chunk.
+    if use_wifi:
+        # USB: device_id:u16 + MSG_FILE_DATA:u8 + segment header:u16
+        usb_data_max = MTU_USB - 2 - 1 - HEADER_SIZE
+        # WiFi/TCP application message: MSG_FILE_DATA:u8 + segment header:u16
+        radio_data_max = MTU_WIFI - 1 - HEADER_SIZE
+    else:
+        # USB: peer MAC:6 + MSG_FILE_DATA:u8 + segment header:u16
+        usb_data_max = MTU_USB - 6 - 1 - HEADER_SIZE
+        # ESP-NOW: shared key:16 + MSG_FILE_DATA:u8 + segment header:u16
+        radio_data_max = MTU_ESPNOW - 16 - 1 - HEADER_SIZE
+
+    MAX_SEGMENT_SIZE = min(usb_data_max, radio_data_max)
     num_segments = (total_size + MAX_SEGMENT_SIZE - 1) // MAX_SEGMENT_SIZE
 
     peer_mac = b""

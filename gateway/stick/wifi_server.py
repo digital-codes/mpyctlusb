@@ -39,7 +39,7 @@ import socket
 import micropython
 import usb_channel_server as ucs
 import time
-from channel_defs import KIND_BIDI, DIR_BIDI, MSG_EVENT, MSG_COMMAND, CHANNEL_WIFI
+from channel_defs import KIND_BIDI, DIR_BIDI, MSG_EVENT, MSG_COMMAND, CHANNEL_WIFI, MTU_WIFI, MTU_USB
 
 # WiFi AP configuration - read from private.py with defaults
 try:
@@ -184,7 +184,7 @@ class WiFiServer:
                 channel_id,
                 self.KIND,
                 DIR_BIDI,
-                1024,  # Max packet size
+                min(MTU_WIFI, MTU_USB),  # Max packet size
                 name,
                 _WiFiHandlerWrapper(self),
             )

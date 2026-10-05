@@ -33,7 +33,7 @@ import espnow
 import private as pr
 import usb_channel_server as ucs
 import time
-from channel_defs import KIND_BIDI, DIR_BIDI, MSG_EVENT, MSG_COMMAND, MSG_PEER_ADD, MSG_PEER_DEL
+from channel_defs import KIND_BIDI, DIR_BIDI, MSG_EVENT, MSG_COMMAND, MSG_PEER_ADD, MSG_PEER_DEL, MTU_USB, MTU_ESPNOW
     
 # config stuff
 _CONF_FILE = "config.json"

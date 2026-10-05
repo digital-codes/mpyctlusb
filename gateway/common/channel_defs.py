@@ -60,6 +60,11 @@ CTRL_FS_EXISTS = 0x14
 CTRL_LOAD_CHANNEL = 0x20
 CTRL_RESET = 0x21
 
+# USB transport switching.  These commands are only honored on the
+# transport named by the command (HID_ENABLE via HID, HID_DISABLE via custom).
+CTRL_HID_ENABLE = 0x22
+CTRL_HID_DISABLE = 0x23
+
 MSG_FILE_HANDSHAKE = 0x30
 MSG_FILE_DATA = 0x31
 MSG_FILE_ACK = 0x32
