@@ -64,6 +64,7 @@ from channel_defs import (
     CHANNEL_BUTTON,
     CHANNEL_RGB,
     CHANNEL_ESPNOW,
+    MTU_USB,
 )
 
 _default_gateway = None
@@ -122,7 +123,7 @@ class USBChannelServer:
         ep_out,
         ep_in,
         rx_size=4096,
-        max_payload=1024,
+        max_payload=MTU_USB,
         tx_queue_depth=32,
         debug_limit=64,
     ):

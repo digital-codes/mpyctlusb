@@ -40,6 +40,9 @@ from channel_defs import (
     CHANNEL_WIFI,
     CTRL_LOAD_CHANNEL,
     CTRL_GET_WIFI_CLIENTS,
+    MTU_WIFI,
+    MTU_ESPNOW,
+    MTU_USB,
 )
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -390,7 +393,7 @@ def send_test(gateway, channel, use_wifi, data_size=5000, device_id=-1, device_m
     total_size = data_size
     test_data = b"T" * data_size
 
-    MAX_SEGMENT_SIZE = 900
+    MAX_SEGMENT_SIZE = min(MTU_WIFI, MTU_USB) if use_wifi else MTU_ESPNOW
     num_segments = (total_size + MAX_SEGMENT_SIZE - 1) // MAX_SEGMENT_SIZE
 
     peer_mac = b""

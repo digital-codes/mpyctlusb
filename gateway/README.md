@@ -676,3 +676,41 @@ The `CTRL_GET_WIFI_CLIENTS` bug where the host always received "Connected client
 - Add I²C sensor channels
 - Add SPI sensor channels
 - Add channel hot-plug notifications
+
+
+# WSL Use
+
+## List devices
+> usbipd list 
+
+Connected:
+BUSID  VID:PID    DEVICE                                                        STATE
+...
+4-3    303a:4001  USB Serial Device (COM5), Espressif Device                    Not shared
+...
+
+ESP32 should connect as COMx, otherwise get and install driver from M5Stack. 
+
+WSL distro must load driver first:
+> sudo modprobe vhci-hcd  
+
+WIN: Attach the Espressif device (303a:4001)
+> usbipd attach --busid 4-3 --wsl
+
+
+WIN: Might need "binding" first, must be run as admin:
+> usbipd bind --busid 4-3
+  usbipd: info: Using WSL distribution 'Ubuntu-24.04' to attach; the device will be available in all WSL 2 distributions.
+  usbipd: info: Using IP address 172.29.80.1 to reach the host.
+
+WIN: Usb device should be listed as shared:
+> usbipd list 
+
+Connected:
+BUSID  VID:PID    DEVICE                                                        STATE
+...
+4-3    303a:4001  USB Serial Device (COM5), Espressif Device                    Shared
+...
+
+Device should be usable with *mpremote* from WIN and WSL now
+  

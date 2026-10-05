@@ -26,7 +26,15 @@ import time
 import usb.core
 import usb.util
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
+try:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _BASE_DIR = os.getcwd()
+
+_COMMON_DIR = os.path.normpath(os.path.join(_BASE_DIR, "..", "common"))
+if _COMMON_DIR not in sys.path:
+    sys.path.insert(0, _COMMON_DIR)
+
 from channel_defs import (
     MSG_COMMAND,
     MSG_RESPONSE,
@@ -46,6 +54,7 @@ from channel_defs import (
     CTRL_FS_DELETE,
     CTRL_FS_EXISTS,
     CTRL_RESET,
+    MTU_USB
 )
 
 VID = 0x303A
@@ -275,9 +284,6 @@ def fs_list(gateway, path="/"):
     return entries
 
 
-MAX_CHUNK_SIZE = 960
-
-
 def _u32(value):
     return bytes((value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF, (value >> 24) & 0xFF))
 
@@ -289,7 +295,7 @@ def fs_read(gateway, path, max_size=None):
     result = bytearray()
 
     while True:
-        size = MAX_CHUNK_SIZE
+        size = MTU_USB
         if max_size is not None:
             remaining = max_size - offset
             if remaining <= 0:
@@ -319,7 +325,7 @@ def fs_write(gateway, path, data):
     offset = 0
 
     while offset < len(data):
-        chunk = data[offset:offset + MAX_CHUNK_SIZE]
+        chunk = data[offset:offset + MTU_USB]
         offset_bytes = _u32(offset)
         payload = bytes((CTRL_FS_WRITE,)) + path_bytes + b"\0" + offset_bytes + chunk
         gateway.send(CHANNEL_CONTROL, MSG_COMMAND, payload)

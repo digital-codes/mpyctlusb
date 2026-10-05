@@ -63,3 +63,9 @@ CTRL_RESET = 0x21
 MSG_FILE_HANDSHAKE = 0x30
 MSG_FILE_DATA = 0x31
 MSG_FILE_ACK = 0x32
+
+# MTU values
+MTU_WIFI = 1400  # typical MTU for Wi-Fi networks
+MTU_ESPNOW = 250  # typical MTU for ESP-NOW networks
+MTU_USB = 960  # typical MTU for USB connections
+
