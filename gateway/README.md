@@ -1,6 +1,6 @@
 # AtomS3U USB Sensor Gateway
 
-Current status: **working baseline** with ESP-NOW and WiFi support.
+Current status: **working baseline** with ESP-NOW, WiFi, and dual USB transport (vendor bulk + Windows HID).
 
 ## Overview
 
@@ -22,8 +22,9 @@ common/                     Shared constants between host and stick
     channel_defs.py        Message types, channel kinds, directions
 
 stick/                     AtomS3U MicroPython, installed on the board
-    boot.py                USB enumeration only
-    usb_channel_server.py  USB transport, framing, channel management
+    boot.py                Composite USB enumeration (CDC + bulk + HID)
+    usb_channel_server.py  Protocol framing and channel management
+    usb_transport_mux.py   Vendor-bulk/HID transport multiplexer
     button_sensor.py       channel 1, GPIO41 input
     rgb_sensor.py          channel 2, GPIO35 NeoPixel output
     espnow_server.py       channel 3, ESP-NOW radio (bi-directional)
@@ -81,15 +82,48 @@ tests/                     Host-side smoke test
 
 ## USB Transport
 
-- Composite USB device
-  - Interface 0/1: MicroPython CDC REPL
-  - Interface 2: Vendor-specific bulk interface
-- 4-byte framing:
-  - channel (u8)
-  - message type (u8)
-  - payload length (u16 little-endian)
-- Full duplex operation, binary payloads
-- Channel discovery, Ping/Pong, dynamic registration, debug logging
+The stick enumerates as one composite USB device:
+
+- Interface 0/1: MicroPython CDC REPL
+- Interface 2: vendor-specific bulk transport (`0x03` OUT / `0x83` IN)
+- Interface 3: vendor-defined HID transport (`0x04` OUT / `0x84` IN)
+
+The vendor bulk transport is the default after boot and after every USB reset.  The
+protocol can switch transports without changing the higher-level channel framing:
+
+- `CTRL_HID_ENABLE` (`0x22`) is accepted through HID and switches normal traffic to HID.
+- `CTRL_HID_DISABLE` (`0x23`) is accepted through the vendor interface and switches normal traffic back to vendor bulk.
+- The inactive transport remains armed only so its corresponding switch command can be received; ordinary traffic arriving on the inactive transport is ignored.
+- The switch happens before the status response, so the ACK is returned through the newly active transport.
+
+HID uses 64-byte reports.  Byte 0 contains the valid data length and bytes 1..63 carry
+up to 63 bytes of the existing USBChannel byte stream.  This HID report chunking is
+below the USBChannel protocol and does not change channel packet sizes.
+
+USBChannel framing remains:
+
+- channel (u8)
+- message type (u8)
+- payload length (u16 little-endian)
+- payload
+
+The transport supports full-duplex binary payloads, channel discovery, Ping/Pong,
+dynamic registration and debug logging.
+
+### MTU layers
+
+The MTU constants describe different layers and must not be used interchangeably:
+
+- `MTU_USB = 960`: maximum USBChannel frame/payload transport size used by the host/stick USB protocol fragmentation.
+- `MTU_WIFI = 1400`: WiFi-side packet limit.
+- `MTU_ESPNOW = 250`: complete ESP-NOW on-air payload limit.
+- A channel's advertised `max_packet` is a logical channel/medium limit and may be larger than `MTU_USB`; USB fragmentation/reassembly handles that case.
+- HID's 63-byte data-per-report limit is an additional transport chunking layer below `MTU_USB`, not a channel MTU.
+
+For radio file transfer the usable data segment must also reserve protocol overhead.
+ESP-NOW reserves 16 bytes for the shared key, 1 byte for the radio message type and
+2 bytes for the segment header, leaving 231 bytes of file data per full 250-byte
+ESP-NOW packet.  WiFi similarly reserves its radio protocol headers.
 
 ---
 
@@ -403,6 +437,25 @@ Tests framing, ping, channel list, status, RGB round trip, button events, wirele
 
 ---
 
+## Smoke Tests
+
+Run the host-side regression suite with:
+
+```bash
+python tests/usb_channel_smoketest.py
+```
+
+The suite uses mocked MicroPython hardware/radio modules and covers the existing
+USBChannel protocol, synchronous/asynchronous USB IN completion, the custom/HID
+transport switch cycle, MTU independence (`channel.max_packet > MTU_USB`), WiFi
+client identification/lookup/TUI synchronization, and ESP-NOW peer management,
+authentication, receive draining, exact-`MTU_ESPNOW` transmission and MTU+1 rejection.
+
+`host/winHdTest.py` is the Windows hardware HID smoke test.  It verifies
+`HID_ENABLE`, the status ACK over HID, and Ping/Pong over the HID transport.
+
+---
+
 ## Debugging
 
 ```python
@@ -463,7 +516,7 @@ WIFI_KEY = "00112233445566778899aabbccddeeff"
 
 ## Filesystem Operations
 
-The gateway supports filesystem operations on the device, similar to `mpremote` commands. These are implemented via the control channel using `MSG_COMMAND` with `CTRL_FS_*` commands. Large files are transferred in 960-byte chunks.
+The gateway supports filesystem operations on the device, similar to `mpremote` commands. These are implemented via the control channel using `MSG_COMMAND` with `CTRL_FS_*` commands. Large writes are split so that the complete control payload, including command/path/offset overhead, stays within `MTU_USB`; reads request chunks up to the USB transport limit.
 
 ### Host Tool: fs_util.py
 
@@ -515,7 +568,7 @@ Error: MSG_ERROR on failure
 #### CTRL_FS_WRITE (0x12)
 - Request: `CTRL_FS_WRITE + path + null + offset(4) + data`
 - Response: `bytes_written (u32)`
-- Large files are written in 960-byte chunks, appended sequentially
+- Large files are written in chunks sized to `MTU_USB` minus the control/path/offset overhead, appended sequentially
 
 #### CTRL_FS_DELETE (0x13)
 - Request: `CTRL_FS_DELETE + path string (utf-8)`
@@ -574,7 +627,7 @@ The protocol uses a 16-bit header per packet:
 
 **Data Transfer Phase:**
 1. Source sends `MSG_FILE_DATA` with: `header(2) + segment_data(~900 bytes)`
-2. Segment size is limited to 900 bytes (fits wifi_server's 1024 max_packet)
+2. Segment size is derived from the selected medium MTU and all protocol overhead (WiFi or ESP-NOW)
 3. Target responds with `MSG_FILE_ACK` per segment
 4. Target echoes back the data for verification
 5. Source waits for both ACK and echo per segment

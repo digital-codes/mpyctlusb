@@ -241,6 +241,7 @@ class _ESPNow:
     def __init__(self):
         self.peers_table = {}
         self.rx = []
+        self.sent = []
 
     def active(self, state=None):
         return True
@@ -269,7 +270,11 @@ class _ESPNow:
         return (None, None)
 
     def send(self, mac, message):
-        """Mock send - returns True for success."""
+        """Mock real ESP-NOW MTU behaviour and retain transmitted packets."""
+        message = bytes(message)
+        if len(message) > self.MAX_DATA_LEN:
+            raise OSError(90, "ESP-NOW payload exceeds MAX_DATA_LEN")
+        self.sent.append((bytes(mac), message))
         return True
 
     def stats(self):
@@ -735,6 +740,9 @@ class FakeGateway:
     def register_channel(self, *args, **kwargs):
         pass
 
+    def unregister_channel(self, *args, **kwargs):
+        pass
+
 
 ws = wifi_server.WiFiServer(channel_id=3, debug=False)
 ws.gateway = FakeGateway()
@@ -810,3 +818,87 @@ assert 2 in tui.wifi_clients
 debug("TUI WiFi client sync test passed")
 
 print("PASS: All WiFi-specific tests passed")
+
+
+# --- ESP-NOW-specific tests ----------------------------------------------
+print("\n=== ESP-NOW-specific tests ===")
+
+debug("Testing ESP-NOW MTU independence and outbound boundaries...")
+
+# Create an isolated radio instance.  Its advertised channel packet limit is
+# the ESP-NOW medium MTU and is intentionally independent from MTU_USB.
+egw = FakeGateway()
+er = espnow_server.ESPNowRadio(channel_id=3, gateway=egw, debug=False)
+peer = bytes.fromhex("102030405060")
+er.enableNode(peer, bytes(range(16)))
+
+from channel_defs import MTU_ESPNOW, MTU_USB, MSG_FILE_DATA
+assert MTU_ESPNOW != MTU_USB
+assert er._radio_datalen == MTU_ESPNOW
+
+# On air: shared_key(16) + application bytes.  For radio file-data packets
+# the application bytes themselves contain msg_type(1) + segment header(2),
+# leaving MTU_ESPNOW - 16 - 3 bytes of actual segment data.
+ESPNOW_AUTH_OVERHEAD = 16
+RADIO_MSG_OVERHEAD = 1
+SEGMENT_HEADER = 2
+max_segment = MTU_ESPNOW - ESPNOW_AUTH_OVERHEAD - RADIO_MSG_OVERHEAD - SEGMENT_HEADER
+assert max_segment == 231
+
+# Exact boundary succeeds: 16-byte key + 1-byte file type + 2-byte segment
+# header + 231 data bytes == 250 bytes on air.
+file_data = bytes((MSG_FILE_DATA, 0x10, 0x00)) + bytes((i & 0xff for i in range(max_segment)))
+assert er._handle_outbound(ucs.MSG_COMMAND, peer + file_data) == 1
+assert len(er.radio.sent[-1][1]) == MTU_ESPNOW
+assert er.radio.sent[-1][1][:16] == SHARED_KEY
+
+# One byte over the physical ESP-NOW MTU must fail at the radio boundary,
+# not because of MTU_USB or channel registration.
+too_large = bytes((MSG_FILE_DATA, 0x10, 0x00)) + bytes(max_segment + 1)
+assert er._handle_outbound(ucs.MSG_COMMAND, peer + too_large) == 0
+
+debug("ESP-NOW exact-MTU / MTU+1 outbound boundary passed")
+
+debug("Testing ESP-NOW peer lookup and management...")
+unknown = bytes.fromhex("a1a2a3a4a5a6")
+assert er._handle_outbound(ucs.MSG_COMMAND, unknown + b"x") == -3
+assert er._handle_outbound(ucs.MSG_PEER_ADD, unknown + bytes(range(16))) == 1
+assert unknown in er.get_peer_macs()
+assert er._handle_outbound(ucs.MSG_PEER_DEL, unknown) == 1
+assert unknown not in er.get_peer_macs()
+debug("ESP-NOW peer lookup/management passed")
+
+debug("Testing ESP-NOW authenticated receive and drain behaviour...")
+# Known/authenticated peer is forwarded with MAC + encoded RSSI + app data.
+egw.sent.clear()
+er.radio.rx.append((peer, SHARED_KEY + b"hello"))
+er._drain(0)
+assert len(egw.sent) == 1
+e_channel, e_type, e_payload = egw.sent[0]
+assert e_channel == 3 and e_type == ucs.MSG_EVENT
+assert e_payload[:6] == peer
+assert e_payload[6] == ((-55 + 256) & 0xff)
+assert e_payload[7:] == b"hello"
+
+# Wrong key is rejected and never forwarded.
+before_rejected = er.rejected
+egw.sent.clear()
+er.radio.rx.append((peer, bytes(16) + b"bad"))
+er._drain(0)
+assert egw.sent == []
+assert er.rejected == before_rejected + 1
+
+# Unknown peer is skipped, but a following valid peer in the same drain is
+# still processed (regression coverage for queue draining).
+egw.sent.clear()
+er.radio.rx.extend([
+    (unknown, SHARED_KEY + b"ignored"),
+    (peer, SHARED_KEY + b"after-unknown"),
+])
+er._drain(0)
+assert len(egw.sent) == 1
+assert egw.sent[0][2][7:] == b"after-unknown"
+debug("ESP-NOW receive/authentication/drain passed")
+
+er.close()
+print("PASS: All ESP-NOW-specific tests passed")
