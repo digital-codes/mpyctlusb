@@ -52,7 +52,7 @@ if LMK:
 # LMK = None
 
 
-wlan = network.WLAN(network.WLAN.IF_STA)
+wlan = network.WLAN(network.STA_IF)
 try:
     wlan.disconnect()
 except Exception:
